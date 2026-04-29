@@ -6,6 +6,7 @@ mod china;
 mod components;
 mod ctx;
 mod hash;
+mod identify;
 
 use components::Components;
 

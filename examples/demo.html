@@ -30,7 +30,7 @@
       color: inherit;
     }
     button { cursor: pointer; }
-    input[type=text] { min-width: 280px; }
+    input[type=text] { min-width: 320px; }
     .row { display: flex; gap: 12px; flex-wrap: wrap; }
     .card { flex: 1 1 240px; background: #0001; padding: 8px 12px; border-radius: 6px; }
     .card h3 { margin: 0 0 4px; font-size: 13px; }
@@ -38,56 +38,64 @@
              background: #06c2; border-radius: 4px; font-size: 11px; }
     .match-exact { background: #0c04; padding: 4px 8px; border-radius: 4px; }
     .match-fuzzy { background: #cc04; padding: 4px 8px; border-radius: 4px; }
-    .match-ambiguous, .match-new { background: #c004; padding: 4px 8px; border-radius: 4px; }
+    .match-ambiguous, .match-new, .match-offline { background: #c004; padding: 4px 8px; border-radius: 4px; }
   </style>
 </head>
 <body>
   <h1>inf-fingerprint demo</h1>
   <div class="meta">先 <code>wasm-pack build client --target web --release</code>，再用任意静态服务器访问本页。</div>
 
-  <button id="btn-run">采集</button>
-  <button id="btn-rerun">再采一次</button>
-
-  <div id="visitor" class="visitor-id">尚未采集</div>
-
-  <h3>本地 visitor_id（前端兜底）</h3>
-  <div id="local-summary" class="row"></div>
-
-  <h3>服务端推断</h3>
+  <h3>简易调用 — 一行拿稳定 visitor_id</h3>
   <div>
-    Endpoint:
     <input id="endpoint" type="text" value="http://localhost:8080/v1/identify" />
-    <button id="btn-server">POST 到服务端</button>
+    <button id="btn-identify">identify()</button>
+    <button id="btn-force">forceRefresh</button>
   </div>
-  <div id="server-result" style="margin-top: 8px;"></div>
+  <div id="identity" class="visitor-id">尚未采集</div>
+  <pre id="identity-detail">—</pre>
 
-  <h3>完整 JSON</h3>
+  <h3>底层细节（getFingerprint() 的原始 features）</h3>
+  <button id="btn-raw">采集 raw features</button>
+  <div id="local-summary" class="row" style="margin-top: 8px"></div>
   <pre id="full">—</pre>
 
   <script type="module">
-    import init, { getFingerprint } from "../client/pkg/inf_fingerprint.js";
+    import init, { identify, getFingerprint } from "../client/pkg/inf_fingerprint.js";
 
-    let lastVisitorId = null;
-    let lastJson = null;
+    async function runIdentify(forceRefresh = false) {
+      await init();
+      const endpoint = document.getElementById("endpoint").value.trim();
+      const out = document.getElementById("identity");
+      const detail = document.getElementById("identity-detail");
+      out.textContent = "采集中…";
+      try {
+        const id = await identify({
+          endpoint,
+          cacheTtlSeconds: 86400,
+          forceRefresh,
+          timeoutMs: 5000,
+        });
+        const cls = `match-${id.match_kind}`;
+        out.innerHTML = `
+          <span class="${cls}">${id.match_kind}</span>
+          <b>${id.visitor_id}</b>
+          ${id.cached ? "<i>（cache hit）</i>" : ""}
+          ${id.via_persistence ? "<i>（cookie 快路径）</i>" : ""}
+          ${!id.from_server ? "<i>（离线兜底）</i>" : ""}
+        `;
+        detail.textContent = JSON.stringify(id, null, 2);
+      } catch (e) {
+        out.innerHTML = `<span class="match-offline">error</span> ${e.message || e}`;
+        detail.textContent = "";
+      }
+    }
 
-    async function run() {
+    async function runRaw() {
       await init();
       const fp = await getFingerprint();
       const json = fp.toJSON();
-      lastJson = json;
-
-      const visitorEl = document.getElementById("visitor");
-      visitorEl.textContent = fp.visitorId;
-      if (lastVisitorId && lastVisitorId !== fp.visitorId) {
-        visitorEl.style.background = "#f002";
-        visitorEl.title = "visitorId 与上次不一致";
-      } else {
-        visitorEl.style.background = "#0c02";
-      }
-      lastVisitorId = fp.visitorId;
-
-      renderLocalSummary(json);
       document.getElementById("full").textContent = JSON.stringify(json, null, 2);
+      renderLocalSummary(json);
     }
 
     function renderLocalSummary(j) {
@@ -101,7 +109,6 @@
           <div>App：<b>${cn.in_app}</b> ${cn.in_app_version || ""}</div>
           <div>NetType：${cn.volatile?.net_type || "-"}</div>
           <div>X5：${cn.kernel?.x5_tbs || "-"} / XWEB：${cn.kernel?.xweb || "-"}</div>
-          <div>小程序：${cn.volatile?.mini_program_env || "-"}</div>
         `],
         ["Bridges", Object.entries(cn.bridges || {})
           .filter(([_, v]) => (typeof v === "object" ? v?.present : v))
@@ -111,12 +118,14 @@
           <div>WebGL render：${j.components?.webgl_render?.pixel_hash?.slice(0, 8) || "-"} (stable=${j.components?.webgl_render?.stable})</div>
           <div>Audio：${j.components?.audio?.hash?.slice(0, 8) || "-"} (stable=${j.components?.audio?.stable})</div>
         `],
-        ["Integrity", `
-          <div>noisy_count: ${j.integrity?.noisy_count}</div>
-          <div>ua_consistent: ${j.integrity?.ua_consistent}</div>
+        ["Persist", `
+          <div>cookie：${j.components?.persist?.from_cookie}</div>
+          <div>localStorage：${j.components?.persist?.from_local_storage}</div>
+          <div>created_now：${j.components?.persist?.created_now}</div>
         `],
-        ["屏幕", `
-          <div>${j.components?.screen?.width}×${j.components?.screen?.height} @${j.components?.screen?.device_pixel_ratio}x</div>
+        ["WebRTC", `
+          <div>local: ${(j.components?.webrtc?.local_ips || []).join(", ") || "-"}</div>
+          <div>public: ${(j.components?.webrtc?.public_ips || []).join(", ") || "-"}</div>
         `],
       ];
 
@@ -125,42 +134,9 @@
         .join("");
     }
 
-    async function postToServer() {
-      if (!lastJson) {
-        alert("先点「采集」");
-        return;
-      }
-      const endpoint = document.getElementById("endpoint").value.trim();
-      const out = document.getElementById("server-result");
-      out.innerHTML = "POST 中…";
-      try {
-        const r = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(lastJson),
-        });
-        if (!r.ok) {
-          const t = await r.text();
-          out.innerHTML = `<div class="match-new">HTTP ${r.status}: ${t}</div>`;
-          return;
-        }
-        const data = await r.json();
-        const cls = `match-${data.match_kind}`;
-        out.innerHTML = `
-          <div><span class="${cls}">${data.match_kind}</span>
-               server visitor_id: <b>${data.visitor_id}</b></div>
-          <div>score: ${data.score?.toFixed(2)} · 2nd: ${data.second_score === -Infinity ? "-∞" : data.second_score?.toFixed(2)} · obs: ${data.observation_count}</div>
-          <div>drift: ${(data.drift || []).join(", ") || "—"}</div>
-          <pre>${JSON.stringify(data, null, 2)}</pre>
-        `;
-      } catch (e) {
-        out.innerHTML = `<div class="match-new">request failed: ${e.message}</div>`;
-      }
-    }
-
-    document.getElementById("btn-run").addEventListener("click", run);
-    document.getElementById("btn-rerun").addEventListener("click", run);
-    document.getElementById("btn-server").addEventListener("click", postToServer);
+    document.getElementById("btn-identify").addEventListener("click", () => runIdentify(false));
+    document.getElementById("btn-force").addEventListener("click", () => runIdentify(true));
+    document.getElementById("btn-raw").addEventListener("click", runRaw);
   </script>
 </body>
 </html>
