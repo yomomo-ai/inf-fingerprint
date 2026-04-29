@@ -18,7 +18,10 @@ use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{Headers, Request, RequestInit, RequestMode, Response};
 
 const CACHE_KEY: &str = "__inf_fp_identity_cache";
-const CACHE_VERSION: u8 = 1;
+// Bumped from 1 -> 2 when the `confidence` field was added. Old cached
+// entries (without `cf=`) are silently dropped on read; one extra network
+// call is the worst case for an upgraded user.
+const CACHE_VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IdentityResult {
@@ -26,6 +29,14 @@ pub struct IdentityResult {
     pub match_kind: String,
     pub score: f64,
     pub second_score: f64,
+    /// Margin-based confidence in `[0, 1]`, server-computed as
+    /// `sigmoid((score - second_score) / 5)`. `0.99+` means the top
+    /// candidate dominates the second; `0.5` means the matcher couldn't
+    /// distinguish two candidates. Risk-control callers should compare
+    /// this rather than raw `score` (which doesn't normalize across
+    /// population or threshold drift). `0.0` for offline fallback or
+    /// when an older server didn't emit the field.
+    pub confidence: f64,
     pub observation_count: i64,
     pub via_persistence: bool,
     pub from_server: bool,
@@ -43,6 +54,7 @@ struct CachedIdentity {
     match_kind: String,
     score: f64,
     second_score: f64,
+    confidence: f64,
     observation_count: i64,
     via_persistence: bool,
     cached_at_ms: f64,
@@ -50,17 +62,18 @@ struct CachedIdentity {
 
 impl CachedIdentity {
     /// `key=value` line format. Avoids pulling in serde_json (~30 KB gz on
-    /// the wasm bundle) just to (de)serialize this 8-field struct.
+    /// the wasm bundle) just to (de)serialize this 9-field struct.
     /// `visitor_id` and `match_kind` come from server-controlled output that
     /// excludes `\n`, so newline is a safe row delimiter.
     fn to_storage_string(&self) -> String {
         format!(
-            "v={}\nid={}\nk={}\ns={}\nss={}\nc={}\np={}\nt={}",
+            "v={}\nid={}\nk={}\ns={}\nss={}\ncf={}\nc={}\np={}\nt={}",
             self.version,
             self.visitor_id,
             self.match_kind,
             self.score,
             self.second_score,
+            self.confidence,
             self.observation_count,
             if self.via_persistence { 1 } else { 0 },
             self.cached_at_ms,
@@ -73,6 +86,7 @@ impl CachedIdentity {
         let mut match_kind: Option<String> = None;
         let mut score: Option<f64> = None;
         let mut second_score: Option<f64> = None;
+        let mut confidence: Option<f64> = None;
         let mut observation_count: Option<i64> = None;
         let mut via_persistence: Option<bool> = None;
         let mut cached_at_ms: Option<f64> = None;
@@ -85,6 +99,7 @@ impl CachedIdentity {
                 "k" => match_kind = Some(value.to_string()),
                 "s" => score = value.parse().ok(),
                 "ss" => second_score = value.parse().ok(),
+                "cf" => confidence = value.parse().ok(),
                 "c" => observation_count = value.parse().ok(),
                 "p" => via_persistence = Some(value == "1"),
                 "t" => cached_at_ms = value.parse().ok(),
@@ -98,6 +113,7 @@ impl CachedIdentity {
             match_kind: match_kind?,
             score: score?,
             second_score: second_score?,
+            confidence: confidence?,
             observation_count: observation_count?,
             via_persistence: via_persistence?,
             cached_at_ms: cached_at_ms?,
@@ -190,6 +206,7 @@ async fn collect_and_post(
                 match_kind: server.match_kind,
                 score: server.score,
                 second_score: server.second_score.unwrap_or(f64::NEG_INFINITY),
+                confidence: server.confidence,
                 observation_count: server.observation_count,
                 via_persistence: server.via_persistence,
                 from_server: true,
@@ -216,6 +233,10 @@ fn offline_result(local_visitor_id: String) -> IdentityResult {
         match_kind: "offline".to_string(),
         score: 0.0,
         second_score: f64::NEG_INFINITY,
+        // Offline path can't compute a margin against other candidates;
+        // 0.0 = "no signal", aligns with how the server reports
+        // confidence when score is non-positive.
+        confidence: 0.0,
         observation_count: 0,
         via_persistence: false,
         from_server: false,
@@ -235,6 +256,11 @@ struct ServerResponse {
     observation_count: i64,
     #[serde(default)]
     via_persistence: bool,
+    /// Margin-based confidence in `[0, 1]`. Older servers that don't
+    /// emit this field yet decode as `0.0`; treat 0.0 as "unknown" on
+    /// the consumer side rather than "definitely not confident".
+    #[serde(default)]
+    confidence: f64,
 }
 
 async fn post_features(
@@ -298,6 +324,7 @@ fn read_cache(ttl_seconds: f64) -> Option<IdentityResult> {
         match_kind: parsed.match_kind,
         score: parsed.score,
         second_score: parsed.second_score,
+        confidence: parsed.confidence,
         observation_count: parsed.observation_count,
         via_persistence: parsed.via_persistence,
         from_server: true,
@@ -320,6 +347,7 @@ fn write_cache(identity: &IdentityResult) {
         match_kind: identity.match_kind.clone(),
         score: identity.score,
         second_score: identity.second_score,
+        confidence: identity.confidence,
         observation_count: identity.observation_count,
         via_persistence: identity.via_persistence,
         cached_at_ms: identity.cached_at_ms,
