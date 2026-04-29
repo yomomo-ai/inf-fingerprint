@@ -7,15 +7,65 @@ use web_sys::{OfflineAudioContext, OscillatorType};
 pub struct AudioFp {
     pub hash: String,
     pub sample_checksum: f64,
+    /// Median-of-N checksum rounded to 2 decimals. Resilient against per-render noise
+    /// injection (Safari 17+ private mode, iOS 26 ATFP).
+    pub stable_checksum: f64,
     pub sample_count: u32,
-    pub mode: &'static str,
+    /// True when N renders produced identical output. False indicates noise injection.
+    pub stable: bool,
+    pub renders: u32,
 }
 
 pub async fn collect() -> Option<AudioFp> {
-    try_collect().await.ok()
+    let mut checksums = Vec::with_capacity(5);
+    let mut first_bytes: Option<Vec<u8>> = None;
+    let mut all_identical = true;
+
+    for i in 0..5 {
+        let Some((checksum, bytes)) = render_one().await else {
+            if i == 0 {
+                return None;
+            }
+            break;
+        };
+        if let Some(prev) = &first_bytes {
+            if prev != &bytes {
+                all_identical = false;
+            }
+        } else {
+            first_bytes = Some(bytes);
+        }
+        checksums.push(checksum);
+    }
+
+    if checksums.is_empty() {
+        return None;
+    }
+
+    let primary_bytes = first_bytes.unwrap_or_default();
+    let primary_checksum = checksums[0];
+
+    // Median + round to 2 decimals = stable across noise.
+    let mut sorted = checksums.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let stable_checksum = (median * 100.0).round() / 100.0;
+
+    Some(AudioFp {
+        hash: crate::hash::hash_bytes(&primary_bytes),
+        sample_checksum: primary_checksum,
+        stable_checksum,
+        sample_count: (primary_bytes.len() / 4) as u32,
+        stable: all_identical,
+        renders: checksums.len() as u32,
+    })
 }
 
-async fn try_collect() -> Result<AudioFp, JsValue> {
+async fn render_one() -> Option<(f64, Vec<u8>)> {
+    try_render().await.ok()
+}
+
+async fn try_render() -> Result<(f64, Vec<u8>), JsValue> {
     let ctx = OfflineAudioContext::new_with_number_of_channels_and_length_and_sample_rate(
         1, 5000, 44100.0,
     )?;
@@ -51,11 +101,5 @@ async fn try_collect() -> Result<AudioFp, JsValue> {
         checksum += v.abs() as f64;
         bytes.extend_from_slice(&v.to_le_bytes());
     }
-
-    Ok(AudioFp {
-        hash: crate::hash::hash_bytes(&bytes),
-        sample_checksum: checksum,
-        sample_count: window.len() as u32,
-        mode: "offline",
-    })
+    Ok((checksum, bytes))
 }

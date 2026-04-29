@@ -5,12 +5,46 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 #[derive(Serialize)]
 pub struct CanvasFp {
     pub hash: String,
+    /// Hash of a second pass on a fresh canvas. Differs from `hash` when the browser
+    /// injects per-call randomization (Brave farbling, Safari 17+ ATFP).
+    pub hash_replay: Option<String>,
+    /// `hash == hash_replay` — caller may exclude this signal from visitor_id when false.
+    pub stable: bool,
     pub data_url_len: usize,
     pub winding: bool,
     pub cjk_text_width: f64,
 }
 
 pub fn collect() -> Option<CanvasFp> {
+    let pass1 = render_once()?;
+    let hash1 = crate::hash::hash_bytes(pass1.data_url.as_bytes());
+
+    let pass2 = render_once();
+    let (hash2, stable) = match pass2 {
+        Some(p) => {
+            let h = crate::hash::hash_bytes(p.data_url.as_bytes());
+            (Some(h.clone()), h == hash1)
+        }
+        None => (None, false),
+    };
+
+    Some(CanvasFp {
+        hash: hash1,
+        hash_replay: hash2,
+        stable,
+        data_url_len: pass1.data_url.len(),
+        winding: pass1.winding,
+        cjk_text_width: pass1.cjk_text_width,
+    })
+}
+
+struct RenderResult {
+    data_url: String,
+    winding: bool,
+    cjk_text_width: f64,
+}
+
+fn render_once() -> Option<RenderResult> {
     let document = crate::ctx::document()?;
     let canvas: HtmlCanvasElement = document.create_element("canvas").ok()?.dyn_into().ok()?;
     canvas.set_width(280);
@@ -44,17 +78,16 @@ pub fn collect() -> Option<CanvasFp> {
     ctx.fill();
 
     ctx.set_font("16px sans-serif");
-    let cjk_width = ctx
+    let cjk_text_width = ctx
         .measure_text("你好世界")
         .ok()
         .map(|m| m.width())
         .unwrap_or(0.0);
 
     let data_url = canvas.to_data_url().ok()?;
-    Some(CanvasFp {
-        hash: crate::hash::hash_bytes(data_url.as_bytes()),
-        data_url_len: data_url.len(),
+    Some(RenderResult {
+        data_url,
         winding,
-        cjk_text_width: cjk_width,
+        cjk_text_width,
     })
 }
