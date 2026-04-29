@@ -18,7 +18,10 @@ async fn main() -> Result<()> {
     let pool = store::connect(&cfg).await?;
     store::migrate(&pool, &cfg.database.schema).await?;
 
-    let bucket_cache = matcher::new_bucket_cache(10_000, 60);
+    let bucket_cache = matcher::new_bucket_cache(
+        cfg.matcher.bucket_cache.capacity,
+        cfg.matcher.bucket_cache.ttl.as_secs(),
+    );
 
     let state = api::AppState {
         pool,

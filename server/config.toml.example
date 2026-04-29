@@ -13,16 +13,23 @@ max_conns = 16
 min_conns = 4
 max_conn_lifetime = "1h"
 max_conn_idle_time = "5m"
-connect_timeout = "10s"
 acquire_timeout = "5s"
-health_check_period = "30s"
 statement_timeout = "5s"
 
 [server]
 bind = "0.0.0.0:28091"
+# Leave commented out to allow unauthenticated calls (browsers can't hide a
+# key anyway; rely on edge rate-limit). Set only when gating server-side
+# callers from a trusted environment.
 # api_key = "long-random-string"
 
 [matcher]
 match_threshold = 12.0
 ambiguous_threshold = 6.0
 max_candidates = 200
+
+[matcher.bucket_cache]
+# In-memory cache of bucket → candidate signatures. Hot buckets (popular
+# iPhone+WeChat combos) hit this 99%+ of the time and skip the DB read path.
+capacity = 10000
+ttl = "60s"

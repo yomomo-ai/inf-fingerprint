@@ -31,13 +31,7 @@ pub struct Pool {
     #[serde(with = "humantime_serde")]
     pub max_conn_idle_time: Duration,
     #[serde(with = "humantime_serde")]
-    #[allow(dead_code)] // sqlx pools merge connect/acquire timeouts under acquire_timeout
-    pub connect_timeout: Duration,
-    #[serde(with = "humantime_serde")]
     pub acquire_timeout: Duration,
-    #[serde(default, with = "humantime_serde")]
-    #[allow(dead_code)] // sqlx tests on acquire — informational
-    pub health_check_period: Duration,
     #[serde(with = "humantime_serde")]
     pub statement_timeout: Duration,
 }
@@ -54,6 +48,24 @@ pub struct Matcher {
     pub match_threshold: f64,
     pub ambiguous_threshold: f64,
     pub max_candidates: usize,
+    #[serde(default)]
+    pub bucket_cache: BucketCache,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BucketCache {
+    pub capacity: u64,
+    #[serde(with = "humantime_serde")]
+    pub ttl: Duration,
+}
+
+impl Default for BucketCache {
+    fn default() -> Self {
+        Self {
+            capacity: 10_000,
+            ttl: Duration::from_secs(60),
+        }
+    }
 }
 
 impl Config {
