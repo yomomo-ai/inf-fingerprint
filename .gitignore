@@ -21,3 +21,6 @@ pnpm-lock.yaml
 
 # Logs
 *.log
+
+# Server config (real credentials)
+server/config.toml

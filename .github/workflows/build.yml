@@ -20,10 +20,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
-      - run: cargo test --lib china::tests
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p inf-fingerprint --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo test -p inf-fingerprint --lib china::tests
+      - run: cargo test -p inf-fingerprint-server
 
-  build:
+  client:
     runs-on: ubuntu-latest
     needs: check
     steps:
@@ -38,12 +40,12 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - run: wasm-pack build --target web --release
+      - run: wasm-pack build client --target web --release
 
       - name: Bundle size
         run: |
-          ls -lh pkg/
-          for f in pkg/*.wasm pkg/*.js; do
+          ls -lh client/pkg/
+          for f in client/pkg/*.wasm client/pkg/*.js; do
             size=$(wc -c <"$f")
             gz=$(gzip -c "$f" | wc -c)
             printf '%s | %s B (%s B gz)\n' "$(basename "$f")" "$size" "$gz" >> $GITHUB_STEP_SUMMARY
@@ -52,4 +54,21 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: pkg
-          path: pkg/
+          path: client/pkg/
+
+  server:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release -p inf-fingerprint-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-binary
+          path: target/release/inf-fingerprint-server

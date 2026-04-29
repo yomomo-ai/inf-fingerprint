@@ -1,0 +1,28 @@
+# inf-fingerprint server config — copy to config.toml and fill in your values.
+
+[database]
+host = "127.0.0.1"
+port = 5432
+user = "inf_fp"
+password = "change-me"
+db_name = "inf_fp"
+schema = "inf_fp"
+
+[database.pool]
+max_conns = 16
+min_conns = 4
+max_conn_lifetime = "1h"
+max_conn_idle_time = "5m"
+connect_timeout = "10s"
+acquire_timeout = "5s"
+health_check_period = "30s"
+statement_timeout = "5s"
+
+[server]
+bind = "0.0.0.0:8080"
+# api_key = "long-random-string"
+
+[matcher]
+match_threshold = 8.0
+ambiguous_threshold = 4.0
+max_candidates = 200
