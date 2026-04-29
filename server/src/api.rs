@@ -158,4 +158,3 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
 }
-
