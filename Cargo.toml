@@ -1,111 +1,28 @@
-[package]
-name = "inf-fingerprint"
-version = "0.1.0"
+[workspace]
+members = ["client"]
+resolver = "2"
+
+[workspace.package]
 edition = "2021"
 authors = ["yomomo-ai <lyy.yiyang@gmail.com>"]
-description = "Browser fingerprint library, Rust to WASM, tuned for Chinese mainland mobile in-app browsers."
 license = "MIT"
 repository = "https://github.com/yomomo-ai/inf-fingerprint"
-publish = false
+rust-version = "1.85"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-# wasm-opt skipped here; binaryen GitHub download is flaky from mainland.
-# Run `wasm-opt -Oz` on pkg/*.wasm separately if needed.
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
-
-[package.metadata.wasm-pack.profile.profiling]
-wasm-opt = false
-
-[features]
-default = ["panic_hook"]
-panic_hook = ["dep:console_error_panic_hook"]
-
-[dependencies]
-wasm-bindgen = "0.2.100"
-wasm-bindgen-futures = "0.4.50"
-js-sys = "0.3.77"
+[workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde-wasm-bindgen = "0.6.5"
 serde_json = "1.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-console_error_panic_hook = { version = "0.1.7", optional = true }
-
-[dependencies.web-sys]
-version = "0.3.77"
-features = [
-    "Window",
-    "WorkerGlobalScope",
-    "WorkerNavigator",
-    "Document",
-    "Element",
-    "HtmlElement",
-    "Navigator",
-    "NavigatorUaData",
-    "UaDataValues",
-    "Screen",
-    "ScreenOrientation",
-    "Performance",
-    "Storage",
-    "HtmlCanvasElement",
-    "CanvasRenderingContext2d",
-    "TextMetrics",
-    "WebGlRenderingContext",
-    "WebGl2RenderingContext",
-    "WebGlActiveInfo",
-    "WebGlShaderPrecisionFormat",
-    "AudioContext",
-    "OfflineAudioContext",
-    "OscillatorNode",
-    "OscillatorType",
-    "AudioBuffer",
-    "AudioDestinationNode",
-    "AudioNode",
-    "AudioParam",
-    "DynamicsCompressorNode",
-    "AudioContextState",
-    "MediaDevices",
-    "MediaDeviceInfo",
-    "MediaDeviceKind",
-    "Permissions",
-    "PermissionState",
-    "PermissionStatus",
-    "MediaQueryList",
-    "SpeechSynthesis",
-    "SpeechSynthesisVoice",
-    "RtcPeerConnection",
-    "RtcConfiguration",
-    "RtcSessionDescription",
-    "RtcSessionDescriptionInit",
-    "RtcSdpType",
-    "RtcIceServer",
-    "RtcDataChannel",
-    "RtcDataChannelInit",
-    "RtcPeerConnectionIceEvent",
-    "RtcIceCandidate",
-    "WebGlBuffer",
-    "WebGlProgram",
-    "WebGlShader",
-    "WebGlUniformLocation",
-    "WebGlContextAttributes",
-    "DomRect",
-    "DomRectReadOnly",
-    "DomRectList",
-    "FontFaceSet",
-    "FontFace",
-    "SvgsvgElement",
-    "SvgPathElement",
-    "console",
-]
+anyhow = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
-
-[profile.release.package."*"]
-opt-level = "z"
