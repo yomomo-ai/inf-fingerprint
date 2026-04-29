@@ -17,6 +17,50 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{Headers, Request, RequestInit, RequestMode, Response};
 
+// Hand-rolled TS overlay. wasm-bindgen can't infer types from JsValue, so
+// without these declarations the generated .d.ts surfaces `identify` as
+// `(options: any) => Promise<any>`. The two interfaces below are the
+// authoritative shapes for callers; keep them in sync with `IdentifyOptions`
+// reads above and the `IdentityResult` Rust struct below.
+#[wasm_bindgen(typescript_custom_section)]
+const TS_TYPES: &'static str = r#"
+export interface IdentifyOptions {
+    /** Server URL, e.g. `"https://fp.example.com/v1/identify"`. */
+    endpoint: string;
+    /** Sent as `X-API-Key` header. Browsers must NOT pass this — the key
+     *  is for trusted server-side callers that bypass edge rate limiting. */
+    apiKey?: string;
+    /** Hard cache expiry. Default 86400 (24h). */
+    cacheTtlSeconds?: number;
+    /** SWR soft expiry. Default `cacheTtlSeconds / 2`. */
+    staleSeconds?: number;
+    /** Bypass cache. Default false. */
+    forceRefresh?: boolean;
+    /** Fetch abort timeout in ms. Default 5000. */
+    timeoutMs?: number;
+}
+
+export type MatchKind = "exact" | "fuzzy" | "ambiguous" | "new" | "offline";
+
+export interface IdentityResult {
+    /** Stable visitor ID. UUID hyphenated string when from server;
+     *  16-char hex (xxh3) when `match_kind === "offline"`. */
+    visitor_id: string;
+    match_kind: MatchKind;
+    score: number;
+    second_score: number;
+    /** Margin-based confidence in [0, 1] (sigmoid of score gap).
+     *  Risk-control callers should compare this rather than raw score. */
+    confidence: number;
+    observation_count: number;
+    via_persistence: boolean;
+    from_server: boolean;
+    cached: boolean;
+    stale: boolean;
+    cached_at_ms: number;
+}
+"#;
+
 const CACHE_KEY: &str = "__inf_fp_identity_cache";
 // Bumped from 1 -> 2 when the `confidence` field was added. Old cached
 // entries (without `cf=`) are silently dropped on read; one extra network
@@ -135,8 +179,13 @@ impl CachedIdentity {
 ///
 /// Falls back to a locally-derived `visitor_id` if the server is unreachable
 /// (sets `from_server: false`, `match_kind: "offline"`).
-#[wasm_bindgen(js_name = identify)]
-pub async fn identify(options: JsValue) -> Result<JsValue, JsValue> {
+// `unchecked_return_type` is the inner type — wasm-bindgen auto-wraps async
+// functions' return types in `Promise<>` already, so we pass `IdentityResult`
+// directly rather than `Promise<IdentityResult>` (which would double-wrap).
+#[wasm_bindgen(js_name = identify, unchecked_return_type = "IdentityResult")]
+pub async fn identify(
+    #[wasm_bindgen(unchecked_param_type = "IdentifyOptions")] options: JsValue,
+) -> Result<JsValue, JsValue> {
     let endpoint = crate::ctx::prop_string(&options, "endpoint")
         .ok_or_else(|| JsValue::from_str("identify(): `endpoint` is required"))?;
     let api_key = crate::ctx::prop_string(&options, "apiKey");
