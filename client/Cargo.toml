@@ -16,7 +16,7 @@ crate-type = ["cdylib", "rlib"]
 # binaryen is auto-downloaded from GitHub release; needs network reach.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = [
-    "-O3",
+    "-Oz",
     "--enable-bulk-memory",
     "--enable-mutable-globals",
     "--enable-nontrapping-float-to-int",

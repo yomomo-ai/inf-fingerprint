@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8.9"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "limit"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = "1"
 
 tokio.workspace = true
@@ -28,14 +28,16 @@ xxhash-rust.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-chrono.workspace = true
 
+# Drop sqlx's "chrono" feature — we don't surface chrono types ourselves;
+# Postgres TIMESTAMPTZ is read into uuid/observation_count fields and the
+# server never constructs a chrono::DateTime in user code. Sqlx falls back
+# to its own time handling for the few timestamp columns we expose.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
     "uuid",
-    "chrono",
     "json",
     "macros",
     "migrate",
