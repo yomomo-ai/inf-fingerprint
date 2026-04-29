@@ -53,6 +53,7 @@ function identify(options: {
 | `second_score` | number | 第二高候选分数；越接近 `score` 越说明这次匹配可能模棱两可 |
 | `observation_count` | number | 该 visitor 在服务端累计被观测过多少次（首次访问后 ≥1） |
 | `via_persistence` | boolean | **服务端**侧——`true` 表示客户端在请求体里带了之前存下的 `client_visitor_id` 且与服务端记录吻合，走了快速路径；`false` 表示靠特征 bucket 扫描匹配的（或新访客）。**和 `cached` 字段无关** |
+| `confidence` | number | `[0, 1]` 区间的置信度。基于 score 和 second_score 的边际计算（`sigmoid((score - second_score)/5)`）；`0.99+` 表示 top 候选远超 second，`0.5` 表示难分辨。**风控等场景应该看这个，不应直接看 `score`**——score 是绝对分数受人群分布漂移，confidence 是相对margin |
 | `from_server` | boolean | 本次结果是否最终源自服务端响应。**注意**：从浏览器缓存读出来的也是 `true`（缓存的就是上次成功的服务端响应）；只有服务端完全不可达且无可用缓存时才是 `false` |
 | `cached` | boolean | 本次结果是否直接命中浏览器 localStorage 缓存（没发请求） |
 | `stale` | boolean | 缓存命中但已过 SWR 阈值，后台正在异步刷新；当前调用拿到的还是旧值 |
@@ -206,7 +207,63 @@ if (!id.from_server || !id.visitor_id) {
 
 如果你的服务端运维层启用了"匹配某个 key 的请求绕过限流"的策略，那把那个 key 配给**服务端可信调用方**（不会经过浏览器的）；浏览器集成不需要、也不应该使用。
 
-## 九、版本
+## 九、闭环反馈（服务端 API，非浏览器调用）
+
+> 以下两个端点是**给业务后端用的**，不要从浏览器调用。需要 nginx/网关层用 `X-API-Key` 锁住，避免外部任意调用篡改身份归属。
+
+### 9.1 `POST /v1/feedback` — 显式合并多个 visitor
+
+业务后端在 user 登录、绑定手机号、KYC 完成等"拿到真身"的时刻，可以告诉服务"这几个 visitor_id 其实是同一个人"，服务会：
+1. 把所有相关 observations 重新指派到 canonical（数组首项）
+2. 累加 observation_count
+3. 删掉被合并的 visitor 行（cascade 删 signatures、signature_buckets）
+4. 写一条 `visitor_merges` 审计
+
+请求（msgpack 或 json，看 `Content-Type`）：
+```json
+{
+  "operation": "merge",
+  "visitor_ids": ["uuid_canonical", "uuid_to_merge_1", "uuid_to_merge_2"],
+  "reason": "user_login_uid_12345"
+}
+```
+
+响应：
+```json
+{
+  "canonical_visitor_id": "uuid_canonical",
+  "merged_visitor_ids": ["uuid_to_merge_1", "uuid_to_merge_2"],
+  "observation_count": 47
+}
+```
+
+错误：
+- `400` `operation` 不是 `"merge"` / 列表不足 2 个
+- `500` 数据库异常
+
+### 9.2 `GET /v1/visitors/{visitor_id}/canonical` — 解析合并链
+
+业务侧之前存了某个 visitor_id，过段时间想知道"它有没有被合并到别的 id 上了？"，调这个端点：
+
+```
+GET /v1/visitors/0d9f7c87-0c98-4d12-9c53-.../canonical
+```
+
+响应：
+```json
+{
+  "canonical_visitor_id": "fae45623-...",
+  "redirected": true
+}
+```
+
+`redirected: false` 表示输入的 id 本身就是 canonical（没被合并过）。这个端点幂等、廉价（一次索引查询），可以放心高频调用。
+
+### 9.3 后台自动合并
+
+服务还会每 5 分钟扫一次 signature_buckets，找特征哈希高度重合（symmetric Bayes 平均分 ≥ 30）的 visitor 对自动合并，audit 行 `source = "auto_merge"`。门槛比 `match_threshold + 10`（exact 阈值）还高 8 分，几乎不会误合并。
+
+## 十、版本
 
 - npm 包名：`inf-fingerprint`
 - 当前主版本：`0.1.x`，patch 自动递增（CI 用 main 分支 commit 数当 patch 号）
@@ -214,7 +271,7 @@ if (!id.from_server || !id.visitor_id) {
 
 升级：`npm update inf-fingerprint` 或锁版本 `^0.1.0`。
 
-## 十、反馈
+## 十一、反馈
 
 GitHub Issues：https://github.com/yomomo-ai/inf-fingerprint/issues
 

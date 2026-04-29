@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -8,6 +9,7 @@ mod config;
 mod error;
 mod features;
 mod matcher;
+mod merger;
 mod store;
 
 #[tokio::main]
@@ -24,12 +26,20 @@ async fn main() -> Result<()> {
     );
 
     let state = api::AppState {
-        pool,
-        bucket_cache,
+        pool: pool.clone(),
+        bucket_cache: bucket_cache.clone(),
         match_threshold: cfg.matcher.match_threshold,
         ambiguous_threshold: cfg.matcher.ambiguous_threshold,
         max_candidates: cfg.matcher.max_candidates,
     };
+
+    // Background janitor: every few minutes, find pairs of visitors that
+    // share recall-bucket entries but are stored separately, score them,
+    // and auto-merge any that the matcher would have caught had they
+    // arrived in the same bucket scan. Catches the residual cases where
+    // synchronous matching couldn't (cookie cleared, near-simultaneous
+    // first visits across devices).
+    merger::spawn_auto_merge_task(Arc::new(pool), bucket_cache, cfg.matcher.match_threshold);
 
     let app = api::router(state);
 

@@ -275,7 +275,8 @@ pub async fn identify(
     })
 }
 
-const SIG_COLUMNS: &str = "visitor_id, canonical_ua_hash, math_fp_hash, webgl_params_hash,
+pub(crate) const SIG_COLUMNS: &str =
+    "visitor_id, canonical_ua_hash, math_fp_hash, webgl_params_hash,
     webgl_render_hash, canvas_hash, audio_hash, audio_stable_checksum,
     speech_voices_hash, fonts_sorted_hash, dom_rect_hash,
     screen_w, screen_h, device_pixel_ratio, hw_concurrency,
@@ -307,7 +308,7 @@ const SIG_SELECT_BY_CLIENT_ID: &str = const_format::concatcp!(
 #[derive(sqlx::FromRow, Clone)]
 #[allow(dead_code)]
 pub struct SignatureRow {
-    visitor_id: Uuid,
+    pub(crate) visitor_id: Uuid,
     canonical_ua_hash: String,
     math_fp_hash: Option<String>,
     webgl_params_hash: Option<String>,
@@ -340,7 +341,7 @@ pub struct SignatureRow {
 }
 
 impl SignatureRow {
-    fn to_signature(&self) -> Signature {
+    pub(crate) fn to_signature(&self) -> Signature {
         Signature {
             visitor_id: self.visitor_id,
             canonical_ua_hash: self.canonical_ua_hash.clone(),
@@ -372,6 +373,67 @@ impl SignatureRow {
             ua_model: self.ua_model.clone(),
             ua_platform_version: self.ua_platform_version.clone(),
             webrtc_public_ips: self.webrtc_public_ips.clone().unwrap_or_default(),
+        }
+    }
+
+    /// Build a `Features` view from a stored signature row. Used by the
+    /// background auto-merge pass to score two existing signatures
+    /// against each other (Bayes operates on Signature × Features).
+    /// Fields the DB doesn't preserve (per-call stability flags, in-app
+    /// volatile fields, etc.) are filled with neutral defaults — Bayes
+    /// gracefully treats Option::None as "no signal" with zero penalty.
+    pub(crate) fn synthesize_features(&self) -> Features {
+        Features {
+            canonical_ua_hash: self.canonical_ua_hash.clone(),
+            bucket_recall_keys: Vec::new(),
+            math_fp_hash: self.math_fp_hash.clone(),
+            webgl_params_hash: self.webgl_params_hash.clone(),
+            webgl_render_hash: self.webgl_render_hash.clone(),
+            // Signatures only get persisted on observations that scored
+            // well, which already implies the noise-sensitive features
+            // were stable at write time — assume stable on replay.
+            webgl_render_stable: Some(true),
+            canvas_hash: self.canvas_hash.clone(),
+            canvas_stable: Some(true),
+            audio_hash: self.audio_hash.clone(),
+            audio_stable_checksum: self.audio_stable_checksum,
+            audio_stable: Some(true),
+            speech_voices_hash: self.speech_voices_hash.clone(),
+            fonts_sorted_hash: self.fonts_sorted_hash.clone(),
+            dom_rect_hash: self.dom_rect_hash.clone(),
+            screen_w: self.screen_w,
+            screen_h: self.screen_h,
+            device_pixel_ratio: self.device_pixel_ratio,
+            color_depth: None,
+            hw_concurrency: self.hw_concurrency,
+            device_memory: None,
+            max_touch_points: None,
+            timezone: self.timezone.clone(),
+            locale: self.locale.clone(),
+            language_tag: None,
+            in_app: None,
+            in_app_version: None,
+            in_app_version_code: self.in_app_version_code.clone(),
+            wechat_platform: None,
+            device_vendor: None,
+            system_rom: self.system_rom.clone(),
+            system_version: self.system_version.clone(),
+            device_model: self.device_model.clone(),
+            android_build: self.android_build.clone(),
+            ua_consistent: None,
+            user_agent: None,
+            client_visitor_id: self.client_visitor_id.clone(),
+            battery_charging: self.battery_charging,
+            battery_level: self.battery_level,
+            storage_quota_bytes: self.storage_quota_bytes,
+            storage_usage_bytes: None,
+            ua_architecture: self.ua_architecture.clone(),
+            ua_bitness: None,
+            ua_model: self.ua_model.clone(),
+            ua_platform_version: self.ua_platform_version.clone(),
+            ua_full_version: None,
+            webrtc_public_ips: self.webrtc_public_ips.clone().unwrap_or_default(),
+            webrtc_local_ips: Vec::new(),
         }
     }
 }
