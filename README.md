@@ -66,9 +66,9 @@ Environment overrides config path: `INF_FP_CONFIG=/etc/inf-fp/config.toml`.
 ### Schema isolation
 
 The server runs in a single Postgres database but installs every table under
-its own schema (default `inf_fp`). `search_path` is set on every pooled
+its own schema (default `fingerprint`). `search_path` is set on every pooled
 connection, so application queries stay unqualified. Migrations are tracked
-in `inf_fp._sqlx_migrations` and run automatically on startup.
+in `fingerprint._sqlx_migrations` and run automatically on startup.
 
 ### `POST /v1/identify`
 

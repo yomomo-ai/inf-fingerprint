@@ -3,10 +3,10 @@
 [database]
 host = "127.0.0.1"
 port = 5432
-user = "inf_fp"
+user = "fingerprint"
 password = "change-me"
-db_name = "inf_fp"
-schema = "inf_fp"
+db_name = "fingerprint"
+schema = "fingerprint"
 
 [database.pool]
 max_conns = 16
