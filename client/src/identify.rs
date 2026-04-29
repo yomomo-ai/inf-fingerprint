@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{Headers, Request, RequestCredentials, RequestInit, RequestMode, Response};
+use web_sys::{Headers, Request, RequestInit, RequestMode, Response};
 
 const CACHE_KEY: &str = "__inf_fp_identity_cache";
 const CACHE_VERSION: u8 = 1;
@@ -246,7 +246,6 @@ async fn post_features(
     let opts = RequestInit::new();
     opts.set_method("POST");
     opts.set_mode(RequestMode::Cors);
-    opts.set_credentials(RequestCredentials::Include);
     opts.set_body(&js_sys::Uint8Array::from(body));
 
     let headers = Headers::new()?;
