@@ -1,0 +1,22 @@
+target/
+client/pkg/
+pkg/
+dist/
+
+.git/
+.github/
+
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Real credentials — always gitignored, repeat here so a careless local
+# `docker build .` doesn't leak it into builder layers.
+server/config.toml
+
+README.md
+LICENSE
+examples/
+*.log
