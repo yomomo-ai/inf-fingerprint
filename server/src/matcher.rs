@@ -118,7 +118,10 @@ pub async fn identify(
             // Solid match — update the signature in place.
             let drift = compute_drift_against_db(&candidates, top.visitor_id, f);
             update_signature(&mut tx, top.visitor_id, f).await?;
-            let kind = if top.score >= match_threshold + 6.0 {
+            // Exact: score is well above the fuzzy cutoff. Calibrated so a
+            // clean iOS-WeChat full-feature match (~40) lands as Exact, and a
+            // single-feature drift (~30-35) still lands as Exact.
+            let kind = if top.score >= match_threshold + 10.0 {
                 MatchKind::Exact
             } else {
                 MatchKind::Fuzzy

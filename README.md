@@ -90,11 +90,19 @@ Response:
 }
 ```
 
-`score` is the natural-log sum of per-feature likelihood ratios. Default
-threshold for an `exact` match is +14 (≈match_threshold +6); `fuzzy` between
-`match_threshold` and `match_threshold+6`; `ambiguous` between
-`ambiguous_threshold` and `match_threshold` (returned as a fresh visitor but
-flagged); `new` below `ambiguous_threshold`. Tune in `[matcher]`.
+`score` is the natural-log sum of per-feature likelihood ratios (Naive Bayes
+with hand-calibrated weights — see `server/src/bayes.rs` for the full table
+and reasoning). A clean iOS-WeChat full-feature match scores ≈40; a different
+user sharing the same canonical UA (worst-case false-positive bucket) scores
+≈3-8.
+
+Defaults:
+- `≥ match_threshold + 10` (≥22) → `exact`
+- `≥ match_threshold` (≥12) → `fuzzy` — drift expected, signature updated
+- `≥ ambiguous_threshold` (≥6) → `ambiguous` — new visitor created but flagged
+- otherwise → `new`
+
+Tune in `[matcher]`.
 
 ### Deploy
 

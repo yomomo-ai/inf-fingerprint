@@ -1,11 +1,33 @@
-//! Naive-Bayes scoring with hand-tuned per-feature log-likelihood-ratios.
+//! Naive-Bayes scoring for visitor matching.
 //!
-//! Each feature contributes an independent log(P(value | same)/P(value | different))
-//! term. Match values are positive (raise odds of same-user); mismatches are
-//! negative; missing → 0 (no evidence either way).
+//! Each feature contributes one independent term: log(P(value | same user) /
+//! P(value | different user)). Match values raise the odds of "same"; mismatches
+//! pull them down; missing-on-either-side contributes 0.
 //!
-//! These weights are calibrated by intuition + agent research. As real labels
-//! accumulate (login → known same-user pairs), the table should be re-fit.
+//! Weights are calibrated by:
+//!
+//! 1. **Stability** — P(value unchanged | same device, two visits). High for
+//!    hardware-derived signals (math_fp, screen), lower for things that drift
+//!    legitimately (system_version, in_app_version, canvas/audio under iOS noise).
+//!
+//! 2. **Uniqueness conditional on bucket** — P(value collides | different device,
+//!    SAME bucket). The bucket key is `canonical_ua + screen + hw_concurrency +
+//!    math_fp_hash`, so candidates already share OS family + screen + chip
+//!    class + JS engine. Features whose entropy is *already absorbed by the
+//!    bucket* (like screen, system_rom, math_fp) carry less marginal weight.
+//!    Features whose entropy is *orthogonal to the bucket* (webgl_render
+//!    pixels, fonts, speech voices, canvas) carry more.
+//!
+//! 3. **Asymmetric mismatch cost**. For features that legitimately drift on
+//!    same-device (system_version after OS update, in_app_version after app
+//!    update, canvas under iOS 26 ATFP), the mismatch penalty is mild —
+//!    a single drift shouldn't break a match. For features that essentially
+//!    never change for same device (math_fp, device_model, screen), mismatch
+//!    is a strong negative signal.
+//!
+//! These are educated priors. Once we have logged-in users producing labeled
+//! same-user pairs, we can fit weights from real frequencies and replace this
+//! table with a learned model.
 
 use crate::features::Features;
 use crate::matcher::Signature;
@@ -20,27 +42,35 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
     let mut total = 0.0;
     let mut hits: Vec<(&'static str, f64)> = Vec::new();
 
+    // canonical_ua_hash — bucket-defining; stability ~0.99, population entropy
+    // ~13 bits across CN devices. Within bucket already filtered, but verifying
+    // catches bucket-key hash collisions (rare).
     add_str(
         &mut total,
         &mut hits,
         "canonical_ua",
         Some(sig.canonical_ua_hash.as_str()),
         Some(f.canonical_ua_hash.as_str()),
-        6.0,
-        -6.0,
+        9.0,
+        -5.0,
     );
+
+    // math_fp_hash — JS engine + libm + CPU class. Already largely absorbed by
+    // bucket (math_fp_hash IS part of bucket key). Treat as confirmation.
     add_str(
         &mut total,
         &mut hits,
         "math_fp",
         sig.math_fp_hash.as_deref(),
         f.math_fp_hash.as_deref(),
-        5.0,
-        -5.0,
+        3.0,
+        -3.0,
     );
-    // Noise-sensitive renders: only let them contribute when the client reported `stable`.
-    // If the device is in a noise-injection regime (Brave farbling, iOS 26 ATFP), an
-    // accidental match would be misleading, so we treat it as no evidence.
+
+    // webgl_render_hash — pixel-level GPU output. Highest-entropy signal that
+    // *survives* WebKit normalization, since identical iPhone units produce
+    // subtly different pixels. Skip when client reports stable=false (Brave
+    // farbling, iOS 26 ATFP noise) — accidental matches under noise mislead.
     if f.webgl_render_stable.unwrap_or(true) {
         add_str(
             &mut total,
@@ -49,9 +79,12 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
             sig.webgl_render_hash.as_deref(),
             f.webgl_render_hash.as_deref(),
             5.0,
-            -1.0,
+            -1.5,
         );
     }
+
+    // canvas_hash — high entropy on Android, mostly normalized on iOS. Mild
+    // mismatch penalty because legitimate font/glyph cache changes can drift.
     if f.canvas_stable.unwrap_or(true) {
         add_str(
             &mut total,
@@ -59,10 +92,13 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
             "canvas",
             sig.canvas_hash.as_deref(),
             f.canvas_hash.as_deref(),
-            4.0,
+            3.0,
             -1.0,
         );
     }
+
+    // audio raw hash — heavily normalized on iOS Safari/WeChat (mostly identical
+    // across devices in the same bucket). Weak signal.
     if f.audio_stable.unwrap_or(true) {
         add_str(
             &mut total,
@@ -70,35 +106,45 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
             "audio",
             sig.audio_hash.as_deref(),
             f.audio_hash.as_deref(),
-            3.5,
-            0.0,
+            1.0,
+            -0.5,
         );
     }
 
+    // audio_stable_checksum — rounded-median survives per-render noise (Safari
+    // 17+ private mode, iOS 26 ATFP). Stronger than the raw hash on iOS.
     if let (Some(a), Some(b)) = (sig.audio_stable_checksum, f.audio_stable_checksum) {
-        let v = if (a - b).abs() < 0.005 { 2.5 } else { -0.5 };
+        let v = if (a - b).abs() < 0.005 { 2.0 } else { -0.5 };
         total += v;
         hits.push(("audio_stable_checksum", v));
     }
 
+    // speech_voices — installed TTS voice set, very device-specific (iOS
+    // bundled languages, Android OEM extras). High entropy, stable.
     add_str(
         &mut total,
         &mut hits,
         "speech_voices",
         sig.speech_voices_hash.as_deref(),
         f.speech_voices_hash.as_deref(),
-        4.0,
+        3.5,
         -1.5,
     );
+
+    // fonts — system font set. High entropy (manufacturer + region + apps that
+    // dropped fonts). Stable. Mismatch is a strong negative.
     add_str(
         &mut total,
         &mut hits,
         "fonts",
         sig.fonts_sorted_hash.as_deref(),
         f.fonts_sorted_hash.as_deref(),
-        3.5,
-        -1.0,
+        4.0,
+        -2.0,
     );
+
+    // dom_rect — sub-pixel layout output of transformed elements. High entropy,
+    // stable. Mild mismatch (layout engine update can drift).
     add_str(
         &mut total,
         &mut hits,
@@ -108,16 +154,23 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         3.0,
         -1.0,
     );
+
+    // webgl_params — vendor/renderer/extensions/limits. Mostly bucket-redundant
+    // (same browser version → same params). Stronger negative because mismatch
+    // suggests browser switch.
     add_str(
         &mut total,
         &mut hits,
         "webgl_params",
         sig.webgl_params_hash.as_deref(),
         f.webgl_params_hash.as_deref(),
-        3.0,
-        -1.0,
+        2.0,
+        -2.0,
     );
 
+    // screen dims — already part of bucket key, so within-bucket collision is
+    // tautologically high. Tiny positive as confirmation; large negative on
+    // mismatch flags an upstream bug.
     if let (Some(sw), Some(sh), Some(dpr)) = (f.screen_w, f.screen_h, f.device_pixel_ratio) {
         let dims_match = Some(sw) == sig.screen_w
             && Some(sh) == sig.screen_h
@@ -125,72 +178,90 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
                 Some(a) => (a - dpr).abs() < 0.01,
                 None => false,
             };
-        let v = if dims_match { 2.0 } else { -1.0 };
+        let v = if dims_match { 0.5 } else { -2.0 };
         total += v;
         hits.push(("screen", v));
     }
 
+    // timezone — in CN traffic, ~80% Asia/Shanghai. Match adds little; mismatch
+    // is a strong negative (VPN / cross-region traveler).
     add_str(
         &mut total,
         &mut hits,
         "timezone",
         sig.timezone.as_deref(),
         f.timezone.as_deref(),
-        1.5,
+        0.3,
         -2.5,
     );
+
+    // locale — in CN traffic, ~95% zh-CN. Tiny match contribution.
     add_str(
         &mut total,
         &mut hits,
         "locale",
         sig.locale.as_deref(),
         f.locale.as_deref(),
-        0.5,
-        -0.5,
+        0.2,
+        -1.0,
     );
 
+    // hw_concurrency — partly absorbed by bucket key. Match is weak;
+    // mismatch suggests a real device change.
     if let (Some(a), Some(b)) = (sig.hw_concurrency, f.hw_concurrency) {
-        let v = if (a - b).abs() < 0.5 { 1.0 } else { -1.5 };
+        let v = if (a - b).abs() < 0.5 { 0.5 } else { -1.0 };
         total += v;
         hits.push(("hw_concurrency", v));
     }
 
+    // device_model — empty/generic on iOS ("iPhone"); high-entropy on Android
+    // ("V2307A", "M2102K1AC"). Mismatch on Android is decisive.
     add_str(
         &mut total,
         &mut hits,
         "device_model",
         sig.device_model.as_deref(),
         f.device_model.as_deref(),
-        3.0,
+        1.5,
         -3.0,
     );
+
+    // system_rom (ios / android / harmonyos / miui / ...) — bucket-absorbed.
     add_str(
         &mut total,
         &mut hits,
         "system_rom",
         sig.system_rom.as_deref(),
         f.system_rom.as_deref(),
-        1.5,
+        0.3,
         -2.0,
     );
+
+    // system_version — drifts legitimately on OS updates; soft mismatch.
     add_str(
         &mut total,
         &mut hits,
         "system_version",
         sig.system_version.as_deref(),
         f.system_version.as_deref(),
-        1.0,
+        1.5,
         -0.5,
     );
+
+    // in_app_version_code (WeChat hex) — WeChat updates push every ~2 weeks;
+    // soft mismatch since same user routinely upgrades.
     add_str(
         &mut total,
         &mut hits,
         "in_app_version_code",
         sig.in_app_version_code.as_deref(),
         f.in_app_version_code.as_deref(),
-        2.0,
+        1.0,
         -0.3,
     );
+
+    // android_build — Android build code. High entropy; mismatch could be OS
+    // patch, but typically means different device.
     add_str(
         &mut total,
         &mut hits,
@@ -198,12 +269,15 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         sig.android_build.as_deref(),
         f.android_build.as_deref(),
         2.0,
-        -2.0,
+        -1.0,
     );
 
+    // ua_consistency — incoming features show navigator.platform / userAgent /
+    // userAgentData mismatch. Strong spoofing / DevTools-override signal;
+    // refuse to confidently match against a clean signature.
     if matches!(f.ua_consistent, Some(false)) {
-        total -= 4.0;
-        hits.push(("ua_inconsistency_penalty", -4.0));
+        total -= 5.0;
+        hits.push(("ua_inconsistency_penalty", -5.0));
     }
 
     ScoreBreakdown { total, hits }
@@ -298,41 +372,51 @@ mod tests {
     }
 
     #[test]
-    fn full_match_clears_match_threshold() {
+    fn full_match_clears_exact_threshold() {
+        // Sum of all positives for a clean iOS user (no android_build):
+        // 9 + 3 + 5 + 3 + 1 + 2 + 3.5 + 4 + 3 + 2 + 0.5 + 0.3 + 0.2 + 0.5 + 1.5 + 0.3 + 1.5 + 1
+        // = 40.8
         let s = score(&sig(), &feat());
         assert!(s.total >= 30.0, "expected ≥30, got {}", s.total);
     }
 
     #[test]
-    fn ua_mismatch_swings_score_by_at_least_twelve() {
+    fn ua_mismatch_swings_score_by_fourteen() {
+        // canonical_ua: +9 → -5 = swing 14
         let baseline = score(&sig(), &feat()).total;
         let mut f = feat();
         f.canonical_ua_hash = "different-ua".into();
         let s = score(&sig(), &f);
         assert!(
-            baseline - s.total >= 12.0,
-            "expected ≥12 swing, got {} → {}",
+            (baseline - s.total - 14.0).abs() < 0.01,
+            "expected swing 14, got {} → {} (Δ={})",
             baseline,
-            s.total
+            s.total,
+            baseline - s.total
         );
     }
 
     #[test]
     fn timezone_mismatch_significantly_penalizes() {
+        // tz: +0.3 → -2.5 = swing 2.8
+        let baseline = score(&sig(), &feat()).total;
         let mut f = feat();
         f.timezone = Some("America/Los_Angeles".into());
         let s = score(&sig(), &f);
-        let baseline = score(&sig(), &feat()).total;
-        assert!(s.total < baseline - 3.0);
+        assert!(
+            baseline - s.total > 2.5,
+            "expected ≥2.5 swing, got {}",
+            baseline - s.total
+        );
     }
 
     #[test]
-    fn ua_inconsistency_subtracts_penalty() {
+    fn ua_inconsistency_subtracts_five() {
+        let baseline = score(&sig(), &feat()).total;
         let mut f = feat();
         f.ua_consistent = Some(false);
         let s = score(&sig(), &f);
-        let baseline = score(&sig(), &feat()).total;
-        assert!((baseline - s.total - 4.0).abs() < 0.01);
+        assert!((baseline - s.total - 5.0).abs() < 0.01);
     }
 
     #[test]
@@ -341,7 +425,30 @@ mod tests {
         f.canvas_stable = Some(false);
         f.canvas_hash = Some("totally-different".into());
         let s = score(&sig(), &f);
-        // Canvas would normally be -1 on mismatch, but stable=false skips it.
         assert!(!s.hits.iter().any(|(name, _)| *name == "canvas"));
+    }
+
+    /// Adversary scenario: different person on same iPhone model + WeChat
+    /// version (so canonical_ua collides), but distinct fonts / canvas / etc.
+    /// Must score well below match_threshold.
+    #[test]
+    fn different_user_in_same_bucket_falls_short_of_match() {
+        let mut f = feat();
+        // canonical_ua collides
+        // but everything device-specific differs
+        f.webgl_render_hash = Some("different".into());
+        f.canvas_hash = Some("different".into());
+        f.audio_hash = Some("different".into());
+        f.audio_stable_checksum = Some(999.99);
+        f.speech_voices_hash = Some("different".into());
+        f.fonts_sorted_hash = Some("different".into());
+        f.dom_rect_hash = Some("different".into());
+
+        let s = score(&sig(), &f);
+        assert!(
+            s.total < 12.0,
+            "different-user score {} should be below match_threshold (12.0)",
+            s.total
+        );
     }
 }
