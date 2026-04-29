@@ -1,6 +1,7 @@
 //! End-to-end identification flow: collect features → POST to backend →
 //! return a stable identity. Cached in localStorage so repeat calls within
-//! the TTL window are zero-network.
+//! the TTL window are zero-network. Past the SWR threshold the cached value
+//! is still served instantly while a fresh fetch runs in the background.
 //!
 //! Public API (JS):
 //!
@@ -8,12 +9,12 @@
 //! import init, { identify } from "inf-fingerprint";
 //! await init();
 //! const id = await identify({ endpoint: "https://fp.example.com/v1/identify" });
-//! console.log(id.visitorId, id.matchKind, id.fromServer);
+//! console.log(id.visitor_id, id.match_kind, id.from_server);
 //! ```
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{Headers, Request, RequestCredentials, RequestInit, RequestMode, Response};
 
 const CACHE_KEY: &str = "__inf_fp_identity_cache";
@@ -29,23 +30,15 @@ pub struct IdentityResult {
     pub via_persistence: bool,
     pub from_server: bool,
     pub cached: bool,
+    /// True when the cached entry has crossed the staleSeconds threshold and
+    /// a background refresh has been scheduled. The current call still gets
+    /// the cached value; the refresh will populate the cache for next time.
+    pub stale: bool,
     pub cached_at_ms: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct CachedIdentity {
-    version: u8,
-    visitor_id: String,
-    match_kind: String,
-    score: f64,
-    second_score: f64,
-    observation_count: i64,
-    via_persistence: bool,
-    cached_at_ms: f64,
-}
-
-#[derive(Deserialize)]
-struct CachedIdentityRead {
     version: u8,
     visitor_id: String,
     match_kind: String,
@@ -61,41 +54,80 @@ struct CachedIdentityRead {
 /// `options`: a JS object with these fields (all optional except `endpoint`):
 ///   - `endpoint`: string — server URL, e.g. `"https://fp.example.com/v1/identify"`
 ///   - `apiKey`: string — sent as `X-API-Key` header
-///   - `cacheTtlSeconds`: number — how long to reuse a cached identity (default 86400)
+///   - `cacheTtlSeconds`: number — hard cache expiry (default 86400 = 24h)
+///   - `staleSeconds`: number — cache age past which a background refresh
+///     fires (default cacheTtlSeconds / 2). Caller still gets the cached
+///     value immediately; the refresh updates cache for the next call.
 ///   - `forceRefresh`: bool — bypass cache (default false)
 ///   - `timeoutMs`: number — fetch abort timeout (default 5000)
 ///
-/// Returns a JS object `{ visitorId, matchKind, score, secondScore,
-/// observationCount, viaPersistence, fromServer, cached, cachedAtMs }`.
-///
-/// Falls back to a locally-derived `visitorId` if the server is unreachable
-/// (sets `fromServer: false`, `matchKind: "offline"`).
+/// Falls back to a locally-derived `visitor_id` if the server is unreachable
+/// (sets `from_server: false`, `match_kind: "offline"`).
 #[wasm_bindgen(js_name = identify)]
 pub async fn identify(options: JsValue) -> Result<JsValue, JsValue> {
     let endpoint = crate::ctx::prop_string(&options, "endpoint")
         .ok_or_else(|| JsValue::from_str("identify(): `endpoint` is required"))?;
     let api_key = crate::ctx::prop_string(&options, "apiKey");
     let cache_ttl_s = crate::ctx::prop_number(&options, "cacheTtlSeconds").unwrap_or(86_400.0);
+    let stale_s = crate::ctx::prop_number(&options, "staleSeconds").unwrap_or(cache_ttl_s / 2.0);
     let force_refresh = crate::ctx::prop_bool(&options, "forceRefresh").unwrap_or(false);
     let timeout_ms = crate::ctx::prop_number(&options, "timeoutMs").unwrap_or(5_000.0) as i32;
 
-    // Fast path: serve from cache if fresh.
     if !force_refresh {
-        if let Some(cached) = read_cache(cache_ttl_s) {
+        if let Some(mut cached) = read_cache(cache_ttl_s) {
+            let age_ms = now_ms() - cached.cached_at_ms;
+            if age_ms > stale_s * 1000.0 {
+                cached.stale = true;
+                // Fire-and-forget background refresh. We don't await it; the
+                // current caller already has a usable identity.
+                let endpoint_bg = endpoint.clone();
+                let api_key_bg = api_key.clone();
+                spawn_local(async move {
+                    let _ = collect_and_post(&endpoint_bg, api_key_bg.as_deref(), timeout_ms).await;
+                });
+            }
             return serde_wasm_bindgen::to_value(&cached)
                 .map_err(|e| JsValue::from_str(&e.to_string()));
         }
     }
 
-    // Collect features and encode directly to msgpack — no JS-bridge round-trip.
-    let fp = crate::get_fingerprint().await?;
-    let body_bytes = fp.to_msgpack()?;
+    // Cache miss / forced refresh: block on the full pipeline.
+    let identity = collect_and_post(&endpoint, api_key.as_deref(), timeout_ms).await;
+    serde_wasm_bindgen::to_value(&identity).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Run the full pipeline and write to cache on success. Always returns an
+/// IdentityResult — server failure becomes an `offline` result without
+/// cache write.
+async fn collect_and_post(
+    endpoint: &str,
+    api_key: Option<&str>,
+    timeout_ms: i32,
+) -> IdentityResult {
+    let fp = match crate::get_fingerprint().await {
+        Ok(fp) => fp,
+        Err(e) => {
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "inf-fingerprint: feature collection failed — {:?}",
+                e
+            )));
+            return offline_result(String::new());
+        }
+    };
+
     let local_visitor_id = fp.visitor_id();
+    let body_bytes = match fp.to_msgpack() {
+        Ok(b) => b,
+        Err(e) => {
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "inf-fingerprint: msgpack encode failed — {:?}",
+                e
+            )));
+            return offline_result(local_visitor_id);
+        }
+    };
 
-    // Server roundtrip. On any failure, fall back to local visitor_id.
-    let server_result = post_features(&endpoint, api_key.as_deref(), &body_bytes, timeout_ms).await;
-
-    let identity = match server_result {
+    match post_features(endpoint, api_key, &body_bytes, timeout_ms).await {
         Ok(server) => {
             let result = IdentityResult {
                 visitor_id: server.visitor_id,
@@ -106,6 +138,7 @@ pub async fn identify(options: JsValue) -> Result<JsValue, JsValue> {
                 via_persistence: server.via_persistence,
                 from_server: true,
                 cached: false,
+                stale: false,
                 cached_at_ms: now_ms(),
             };
             write_cache(&result);
@@ -116,21 +149,24 @@ pub async fn identify(options: JsValue) -> Result<JsValue, JsValue> {
                 "inf-fingerprint: server unreachable, falling back to local — {:?}",
                 e
             )));
-            IdentityResult {
-                visitor_id: local_visitor_id,
-                match_kind: "offline".to_string(),
-                score: 0.0,
-                second_score: f64::NEG_INFINITY,
-                observation_count: 0,
-                via_persistence: false,
-                from_server: false,
-                cached: false,
-                cached_at_ms: now_ms(),
-            }
+            offline_result(local_visitor_id)
         }
-    };
+    }
+}
 
-    serde_wasm_bindgen::to_value(&identity).map_err(|e| JsValue::from_str(&e.to_string()))
+fn offline_result(local_visitor_id: String) -> IdentityResult {
+    IdentityResult {
+        visitor_id: local_visitor_id,
+        match_kind: "offline".to_string(),
+        score: 0.0,
+        second_score: f64::NEG_INFINITY,
+        observation_count: 0,
+        via_persistence: false,
+        from_server: false,
+        cached: false,
+        stale: false,
+        cached_at_ms: now_ms(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -194,7 +230,7 @@ fn read_cache(ttl_seconds: f64) -> Option<IdentityResult> {
     let win = web_sys::window()?;
     let storage = win.local_storage().ok()??;
     let raw = storage.get_item(CACHE_KEY).ok()??;
-    let parsed: CachedIdentityRead = serde_json::from_str(&raw).ok()?;
+    let parsed: CachedIdentity = serde_json::from_str(&raw).ok()?;
     if parsed.version != CACHE_VERSION {
         return None;
     }
@@ -211,6 +247,7 @@ fn read_cache(ttl_seconds: f64) -> Option<IdentityResult> {
         via_persistence: parsed.via_persistence,
         from_server: true,
         cached: true,
+        stale: false,
         cached_at_ms: parsed.cached_at_ms,
     })
 }

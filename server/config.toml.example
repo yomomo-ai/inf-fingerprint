@@ -19,7 +19,7 @@ health_check_period = "30s"
 statement_timeout = "5s"
 
 [server]
-bind = "0.0.0.0:8080"
+bind = "0.0.0.0:28091"
 # api_key = "long-random-string"
 
 [matcher]
