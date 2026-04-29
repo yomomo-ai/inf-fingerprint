@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# wasm-pack output
+/pkg
+/dist
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Node (demo)
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Logs
+*.log

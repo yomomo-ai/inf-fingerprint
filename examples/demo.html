@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>inf-fingerprint demo</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC",
+            "Microsoft YaHei", "Helvetica Neue", sans-serif;
+      max-width: 800px; margin: 16px auto; padding: 0 12px;
+    }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    .meta { color: #888; margin-bottom: 12px; }
+    .visitor-id {
+      font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+      font-size: 16px; padding: 8px 12px; background: #0001;
+      border-radius: 6px; word-break: break-all; user-select: all;
+    }
+    pre {
+      background: #0001; padding: 12px; border-radius: 6px;
+      overflow-x: auto; font-size: 12px;
+    }
+    button {
+      padding: 8px 16px; margin: 8px 4px 8px 0;
+      font: inherit; cursor: pointer;
+      border: 1px solid #888; border-radius: 6px; background: transparent;
+      color: inherit;
+    }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .card { flex: 1 1 240px; background: #0001; padding: 8px 12px; border-radius: 6px; }
+    .card h3 { margin: 0 0 4px; font-size: 13px; }
+    .badge { display: inline-block; padding: 2px 6px; margin: 2px;
+             background: #06c2; border-radius: 4px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>inf-fingerprint demo</h1>
+  <div class="meta">先 <code>wasm-pack build --target web --release</code>，再用任意静态服务器访问本页。</div>
+
+  <button id="btn-run">采集</button>
+  <button id="btn-rerun">再采一次</button>
+
+  <div id="visitor" class="visitor-id">尚未采集</div>
+
+  <div id="summary" class="row" style="margin-top: 12px"></div>
+
+  <h3 style="margin-top: 16px">完整 JSON</h3>
+  <pre id="full">—</pre>
+
+  <script type="module">
+    import init, { getFingerprint } from "../pkg/inf_fingerprint.js";
+
+    let lastVisitorId = null;
+
+    async function run() {
+      await init();
+      const fp = await getFingerprint();
+      const json = fp.toJSON();
+
+      const visitorEl = document.getElementById("visitor");
+      visitorEl.textContent = fp.visitorId;
+      if (lastVisitorId && lastVisitorId !== fp.visitorId) {
+        visitorEl.style.background = "#f002";
+        visitorEl.title = "visitorId 与上次不一致";
+      } else {
+        visitorEl.style.background = "#0c02";
+      }
+      lastVisitorId = fp.visitorId;
+
+      renderSummary(json);
+      document.getElementById("full").textContent = JSON.stringify(json, null, 2);
+    }
+
+    function renderSummary(j) {
+      const cn = j.china || {};
+      const cards = [
+        ["设备", `
+          <div>厂商：${cn.device_vendor}</div>
+          <div>系统：${cn.system_rom} ${cn.system_version || ""}</div>
+        `],
+        ["In-App", `
+          <div>App：<b>${cn.in_app}</b> ${cn.in_app_version || ""}</div>
+          <div>NetType：${cn.net_type || "-"}</div>
+          <div>Language：${cn.language_tag || "-"}</div>
+          <div>X5：${cn.x5_kernel ? cn.x5_kernel.version : "-"}</div>
+          <div>小程序：${cn.mini_program_env || "-"}</div>
+        `],
+        ["Bridges", Object.entries(cn.bridges || {})
+          .filter(([_, v]) => v)
+          .map(([k]) => `<span class="badge">${k}</span>`).join("") || "无"],
+        ["渲染", `
+          <div>Canvas：${j.components?.canvas?.hash?.slice(0, 8) || "-"}</div>
+          <div>Audio：${j.components?.audio?.hash?.slice(0, 8) || "-"}</div>
+          <div>WebGL：${j.components?.webgl?.unmasked_renderer || j.components?.webgl?.renderer || "-"}</div>
+        `],
+        ["字体", (j.components?.fonts?.available || []).slice(0, 6).map(f =>
+          `<span class="badge">${f}</span>`).join("") + (j.components?.fonts?.available?.length > 6
+            ? `<span class="badge">+${j.components.fonts.available.length - 6}</span>` : "") || "无"],
+        ["屏幕", `
+          <div>${j.components?.screen?.width}×${j.components?.screen?.height} @${j.components?.screen?.device_pixel_ratio}x</div>
+        `],
+      ];
+
+      const root = document.getElementById("summary");
+      root.innerHTML = cards.map(([title, body]) => `
+        <div class="card"><h3>${title}</h3>${body}</div>
+      `).join("");
+    }
+
+    document.getElementById("btn-run").addEventListener("click", run);
+    document.getElementById("btn-rerun").addEventListener("click", run);
+  </script>
+</body>
+</html>

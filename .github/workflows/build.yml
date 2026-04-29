@@ -1,0 +1,55 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --target wasm32-unknown-unknown --all-features -- -D warnings
+      - run: cargo test --lib china::tests
+
+  build:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - run: wasm-pack build --target web --release
+
+      - name: Bundle size
+        run: |
+          ls -lh pkg/
+          for f in pkg/*.wasm pkg/*.js; do
+            size=$(wc -c <"$f")
+            gz=$(gzip -c "$f" | wc -c)
+            printf '%s | %s B (%s B gz)\n' "$(basename "$f")" "$size" "$gz" >> $GITHUB_STEP_SUMMARY
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg
+          path: pkg/
