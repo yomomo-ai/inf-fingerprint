@@ -71,6 +71,12 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
     // *survives* WebKit normalization, since identical iPhone units produce
     // subtly different pixels. Skip when client reports stable=false (Brave
     // farbling, iOS 26 ATFP noise) — accidental matches under noise mislead.
+    // The next 7 signals collectively *discriminate within a bucket*: when
+    // canonical_ua + screen + chip + engine all match, these are what tell
+    // identical-spec phones apart. Mismatch penalties are tuned so that 5+
+    // simultaneous mismatches push the total below match_threshold even with
+    // every bucket-level signal lined up.
+
     if f.webgl_render_stable.unwrap_or(true) {
         add_str(
             &mut total,
@@ -79,12 +85,10 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
             sig.webgl_render_hash.as_deref(),
             f.webgl_render_hash.as_deref(),
             5.0,
-            -1.5,
+            -2.0,
         );
     }
 
-    // canvas_hash — high entropy on Android, mostly normalized on iOS. Mild
-    // mismatch penalty because legitimate font/glyph cache changes can drift.
     if f.canvas_stable.unwrap_or(true) {
         add_str(
             &mut total,
@@ -93,12 +97,10 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
             sig.canvas_hash.as_deref(),
             f.canvas_hash.as_deref(),
             3.0,
-            -1.0,
+            -2.0,
         );
     }
 
-    // audio raw hash — heavily normalized on iOS Safari/WeChat (mostly identical
-    // across devices in the same bucket). Weak signal.
     if f.audio_stable.unwrap_or(true) {
         add_str(
             &mut total,
@@ -111,16 +113,12 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         );
     }
 
-    // audio_stable_checksum — rounded-median survives per-render noise (Safari
-    // 17+ private mode, iOS 26 ATFP). Stronger than the raw hash on iOS.
     if let (Some(a), Some(b)) = (sig.audio_stable_checksum, f.audio_stable_checksum) {
-        let v = if (a - b).abs() < 0.005 { 2.0 } else { -0.5 };
+        let v = if (a - b).abs() < 0.005 { 2.0 } else { -1.0 };
         total += v;
         hits.push(("audio_stable_checksum", v));
     }
 
-    // speech_voices — installed TTS voice set, very device-specific (iOS
-    // bundled languages, Android OEM extras). High entropy, stable.
     add_str(
         &mut total,
         &mut hits,
@@ -128,11 +126,9 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         sig.speech_voices_hash.as_deref(),
         f.speech_voices_hash.as_deref(),
         3.5,
-        -1.5,
+        -2.5,
     );
 
-    // fonts — system font set. High entropy (manufacturer + region + apps that
-    // dropped fonts). Stable. Mismatch is a strong negative.
     add_str(
         &mut total,
         &mut hits,
@@ -140,11 +136,9 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         sig.fonts_sorted_hash.as_deref(),
         f.fonts_sorted_hash.as_deref(),
         4.0,
-        -2.0,
+        -3.5,
     );
 
-    // dom_rect — sub-pixel layout output of transformed elements. High entropy,
-    // stable. Mild mismatch (layout engine update can drift).
     add_str(
         &mut total,
         &mut hits,
@@ -152,7 +146,7 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         sig.dom_rect_hash.as_deref(),
         f.dom_rect_hash.as_deref(),
         3.0,
-        -1.0,
+        -2.0,
     );
 
     // webgl_params — vendor/renderer/extensions/limits. Mostly bucket-redundant
@@ -280,6 +274,86 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         hits.push(("ua_inconsistency_penalty", -5.0));
     }
 
+    // client_visitor_id — persistence super-cookie. Almost a 1:1 identity
+    // match when present. Mild mismatch because cookie clearing is normal.
+    add_str(
+        &mut total,
+        &mut hits,
+        "client_visitor_id",
+        sig.client_visitor_id.as_deref(),
+        f.client_visitor_id.as_deref(),
+        12.0,
+        -1.5,
+    );
+
+    // ua_model (UA-CH high-entropy) — Chromium devices like "SM-G998B"
+    // identify the exact phone. Very high-entropy on Android.
+    add_str(
+        &mut total,
+        &mut hits,
+        "ua_model",
+        sig.ua_model.as_deref(),
+        f.ua_model.as_deref(),
+        5.0,
+        -3.0,
+    );
+
+    // ua_architecture (arm / arm64 / x86 / x86_64) — hardware-tier signal.
+    add_str(
+        &mut total,
+        &mut hits,
+        "ua_arch",
+        sig.ua_architecture.as_deref(),
+        f.ua_architecture.as_deref(),
+        0.8,
+        -2.0,
+    );
+
+    // ua_platform_version drifts on OS update; soft mismatch.
+    add_str(
+        &mut total,
+        &mut hits,
+        "ua_platform_version",
+        sig.ua_platform_version.as_deref(),
+        f.ua_platform_version.as_deref(),
+        1.0,
+        -0.3,
+    );
+
+    // storage quota — within-bucket (same OS + same Safari/Chrome version) the
+    // quota is often *identical* across devices, so match is weak evidence.
+    // Mismatch is informative because it suggests a real config / disk diff.
+    if let (Some(a), Some(b)) = (sig.storage_quota_bytes, f.storage_quota_bytes) {
+        let ratio = (a - b).abs() as f64 / a.max(b).max(1) as f64;
+        let v = if ratio < 0.05 { 0.5 } else { -1.5 };
+        total += v;
+        hits.push(("storage_quota", v));
+    }
+
+    // battery_level — reasonable match within 5%; otherwise no signal because
+    // it changes constantly.
+    if let (Some(a), Some(b)) = (sig.battery_level, f.battery_level) {
+        let v = if (a - b).abs() < 0.05 { 1.0 } else { 0.0 };
+        if v != 0.0 {
+            total += v;
+            hits.push(("battery_level", v));
+        }
+    }
+
+    // WebRTC public IP — modest match weight: in CN coffee-shop / dorm /
+    // corporate-NAT scenarios, multiple distinct users share the same public
+    // IP. A match is consistent with same-user but not strong evidence on its
+    // own. Mismatch is also weak because users legitimately switch networks.
+    if !sig.webrtc_public_ips.is_empty() && !f.webrtc_public_ips.is_empty() {
+        let overlap = sig
+            .webrtc_public_ips
+            .iter()
+            .any(|ip| f.webrtc_public_ips.contains(ip));
+        let v = if overlap { 1.0 } else { -0.3 };
+        total += v;
+        hits.push(("webrtc_public_ip", v));
+    }
+
     ScoreBreakdown { total, hits }
 }
 
@@ -328,6 +402,14 @@ mod tests {
             system_version: Some("17.5.1".into()),
             in_app_version_code: Some("0x18003133".into()),
             android_build: None,
+            client_visitor_id: Some("uuid-1".into()),
+            battery_charging: None,
+            battery_level: None,
+            storage_quota_bytes: Some(2_000_000_000),
+            ua_architecture: None,
+            ua_model: None,
+            ua_platform_version: None,
+            webrtc_public_ips: vec!["203.0.113.1".into()],
         }
     }
 
@@ -368,6 +450,18 @@ mod tests {
             android_build: None,
             ua_consistent: Some(true),
             user_agent: None,
+            client_visitor_id: Some("uuid-1".into()),
+            battery_charging: None,
+            battery_level: None,
+            storage_quota_bytes: Some(2_000_000_000),
+            storage_usage_bytes: None,
+            ua_architecture: None,
+            ua_bitness: None,
+            ua_model: None,
+            ua_platform_version: None,
+            ua_full_version: None,
+            webrtc_public_ips: vec!["203.0.113.1".into()],
+            webrtc_local_ips: vec![],
         }
     }
 
@@ -429,13 +523,14 @@ mod tests {
     }
 
     /// Adversary scenario: different person on same iPhone model + WeChat
-    /// version (so canonical_ua collides), but distinct fonts / canvas / etc.
-    /// Must score well below match_threshold.
+    /// version (so canonical_ua collides), no persistence cookie shared,
+    /// all device-specific renders differ. Must score below match_threshold.
     #[test]
     fn different_user_in_same_bucket_falls_short_of_match() {
         let mut f = feat();
-        // canonical_ua collides
-        // but everything device-specific differs
+        // No shared cookie — different user, fresh install / different device.
+        f.client_visitor_id = None;
+        // All device-specific renders / hashes differ.
         f.webgl_render_hash = Some("different".into());
         f.canvas_hash = Some("different".into());
         f.audio_hash = Some("different".into());
@@ -443,11 +538,38 @@ mod tests {
         f.speech_voices_hash = Some("different".into());
         f.fonts_sorted_hash = Some("different".into());
         f.dom_rect_hash = Some("different".into());
+        // Different network → different public IP.
+        f.webrtc_public_ips = vec!["198.51.100.5".into()];
 
         let s = score(&sig(), &f);
         assert!(
             s.total < 12.0,
             "different-user score {} should be below match_threshold (12.0)",
+            s.total
+        );
+    }
+
+    #[test]
+    fn matching_client_visitor_id_alone_pushes_above_match_threshold() {
+        // Same device returning, only the persistence cookie + canonical_ua
+        // are usable signals (e.g. paranoid privacy-mode browser blocking
+        // most fingerprint surfaces).
+        let mut f = feat();
+        f.webgl_render_hash = None;
+        f.canvas_hash = None;
+        f.audio_hash = None;
+        f.audio_stable_checksum = None;
+        f.speech_voices_hash = None;
+        f.fonts_sorted_hash = None;
+        f.dom_rect_hash = None;
+        f.webrtc_public_ips = vec![];
+        f.storage_quota_bytes = None;
+        let s = score(&sig(), &f);
+        // canonical_ua (+9) + math (+3) + client_visitor_id (+12) = +24, plus
+        // assorted small signals; well above match_threshold (12).
+        assert!(
+            s.total >= 18.0,
+            "cookie + UA-only score should be ≥18, got {}",
             s.total
         );
     }

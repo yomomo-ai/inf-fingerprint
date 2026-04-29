@@ -12,7 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::{ApiError, ApiResult};
 use crate::features::Features;
-use crate::matcher;
+use crate::matcher::{self, RequestContext};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,6 +65,7 @@ pub struct IdentifyResponse {
     pub candidates: Vec<matcher::CandidateScore>,
     pub drift: Vec<&'static str>,
     pub observation_count: i64,
+    pub via_persistence: bool,
 }
 
 async fn identify(
@@ -78,11 +79,13 @@ async fn identify(
     let features = Features::from_json(&body)
         .ok_or_else(|| ApiError::BadRequest("malformed feature payload".to_string()))?;
 
+    let req = build_request_context(&headers, &addr);
+
     let outcome = matcher::identify(
         &state.pool,
         &features,
         &body,
-        addr.ip(),
+        &req,
         state.match_threshold,
         state.ambiguous_threshold,
         state.max_candidates,
@@ -97,7 +100,47 @@ async fn identify(
         candidates: outcome.candidates,
         drift: outcome.drift,
         observation_count: outcome.observation_count,
+        via_persistence: outcome.via_persistence,
     }))
+}
+
+fn build_request_context(headers: &HeaderMap, addr: &SocketAddr) -> RequestContext {
+    // X-Forwarded-For is set by edges/CDNs. Take the leftmost (originating
+    // client). Fall back to socket peer when behind no proxy.
+    let xff_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let real_ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let ip = xff_ip.or(real_ip).or_else(|| Some(addr.ip().to_string()));
+
+    let dnt = headers
+        .get("dnt")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "1");
+
+    RequestContext {
+        ip,
+        user_agent: header_str(headers, "user-agent"),
+        accept_language: header_str(headers, "accept-language"),
+        sec_ch_ua: header_str(headers, "sec-ch-ua"),
+        sec_ch_ua_platform: header_str(headers, "sec-ch-ua-platform"),
+        referer: header_str(headers, "referer"),
+        dnt,
+    }
+}
+
+fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 fn check_api_key(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {

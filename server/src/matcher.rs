@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
 use serde::Serialize;
 use sqlx::postgres::PgPool;
 use sqlx::types::Json as SqlxJson;
-use std::net::IpAddr;
 use uuid::Uuid;
 
 use crate::bayes;
@@ -34,6 +32,9 @@ pub struct Outcome {
     pub candidates: Vec<CandidateScore>,
     pub drift: Vec<&'static str>,
     pub observation_count: i64,
+    /// True when the match came from the persistence-cookie fast path rather
+    /// than the bucket scan. Useful to spot cookie-stuffing fraud.
+    pub via_persistence: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,38 +61,99 @@ pub struct Signature {
     pub system_version: Option<String>,
     pub in_app_version_code: Option<String>,
     pub android_build: Option<String>,
+    pub client_visitor_id: Option<String>,
+    /// Stored but not currently scored — toggles too frequently to be useful
+    /// for matching. Kept around for behavioral analysis later.
+    #[allow(dead_code)]
+    pub battery_charging: Option<bool>,
+    pub battery_level: Option<f64>,
+    pub storage_quota_bytes: Option<i64>,
+    pub ua_architecture: Option<String>,
+    pub ua_model: Option<String>,
+    pub ua_platform_version: Option<String>,
+    pub webrtc_public_ips: Vec<String>,
+}
+
+/// HTTP-derived request context. Captured for observation logging and to
+/// supplement client-side signals (server-derived IP is harder to spoof than
+/// client-side WebRTC).
+#[derive(Debug, Clone, Default)]
+pub struct RequestContext {
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub accept_language: Option<String>,
+    pub sec_ch_ua: Option<String>,
+    pub sec_ch_ua_platform: Option<String>,
+    pub referer: Option<String>,
+    pub dnt: Option<bool>,
 }
 
 pub async fn identify(
     pool: &PgPool,
     f: &Features,
     raw: &serde_json::Value,
-    client_ip: IpAddr,
+    req: &RequestContext,
     match_threshold: f64,
     ambiguous_threshold: f64,
     max_candidates: usize,
 ) -> Result<Outcome> {
     let mut tx = pool.begin().await?;
 
-    // Pull bucket candidates.
-    let candidates = sqlx::query_as::<_, SignatureRow>(
-        r#"SELECT visitor_id, canonical_ua_hash, math_fp_hash, webgl_params_hash,
-                  webgl_render_hash, canvas_hash, audio_hash, audio_stable_checksum,
-                  speech_voices_hash, fonts_sorted_hash, dom_rect_hash,
-                  screen_w, screen_h, device_pixel_ratio, hw_concurrency,
-                  timezone, locale, device_model, system_rom, system_version,
-                  in_app_version_code, android_build
-           FROM signatures
-           WHERE bucket_key = $1
-           LIMIT $2"#,
-    )
-    .bind(&f.bucket_key)
-    .bind(max_candidates as i64)
-    .fetch_all(&mut *tx)
-    .await
-    .context("fetching bucket candidates")?;
+    // Fast path: client-side persistence cookie. If the claimed id resolves to
+    // a stored signature AND that signature scores well against incoming
+    // features, we trust the claim — single indexed query, no bucket scan.
+    if let Some(claimed) = f.client_visitor_id.as_deref() {
+        if let Some(row) = sqlx::query_as::<_, SignatureRow>(SIG_SELECT_BY_CLIENT_ID)
+            .bind(claimed)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("client_visitor_id lookup")?
+        {
+            let sig = row.to_signature();
+            let s = bayes::score(&sig, f);
+            if s.total >= ambiguous_threshold {
+                let drift = compute_drift_against_db(&[row], sig.visitor_id, f);
+                update_signature(&mut tx, sig.visitor_id, f).await?;
+                let count = bump_observation(&mut tx, sig.visitor_id).await?;
+                let kind = if s.total >= match_threshold + 10.0 {
+                    MatchKind::Exact
+                } else if s.total >= match_threshold {
+                    MatchKind::Fuzzy
+                } else {
+                    MatchKind::Ambiguous
+                };
+                insert_observation(&mut tx, sig.visitor_id, f, raw, req, s.total, kind).await?;
+                tx.commit().await?;
+                return Ok(Outcome {
+                    visitor_id: sig.visitor_id,
+                    match_kind: kind,
+                    score: s.total,
+                    second_score: f64::NEG_INFINITY,
+                    candidates: vec![CandidateScore {
+                        visitor_id: sig.visitor_id,
+                        score: s.total,
+                        hits: s.hits,
+                    }],
+                    drift,
+                    observation_count: count,
+                    via_persistence: true,
+                });
+            }
+            // Cookie value collides with a known visitor but features don't
+            // match — likely cookie reset on a different device, or stolen
+            // cookie. Fall through to bucket scan; we'll either re-match by
+            // features or create a new visitor.
+        }
+    }
 
-    // Score each candidate.
+    // Bucket scan.
+    let candidates = sqlx::query_as::<_, SignatureRow>(SIG_SELECT_BY_BUCKET)
+        .bind(&f.bucket_key)
+        .bind(max_candidates as i64)
+        .fetch_all(&mut *tx)
+        .await
+        .context("fetching bucket candidates")?;
+
     let mut scored: Vec<CandidateScore> = candidates
         .iter()
         .map(|row| {
@@ -115,12 +177,8 @@ pub async fn identify(
 
     let (visitor_id, match_kind, drift) = match &best {
         Some(top) if top.score >= match_threshold => {
-            // Solid match — update the signature in place.
             let drift = compute_drift_against_db(&candidates, top.visitor_id, f);
             update_signature(&mut tx, top.visitor_id, f).await?;
-            // Exact: score is well above the fuzzy cutoff. Calibrated so a
-            // clean iOS-WeChat full-feature match (~40) lands as Exact, and a
-            // single-feature drift (~30-35) still lands as Exact.
             let kind = if top.score >= match_threshold + 10.0 {
                 MatchKind::Exact
             } else {
@@ -129,7 +187,6 @@ pub async fn identify(
             (top.visitor_id, kind, drift)
         }
         Some(top) if top.score >= ambiguous_threshold => {
-            // Soft match — create new visitor but flag ambiguity, log for review.
             let id = create_visitor(&mut tx, f).await?;
             (id, MatchKind::Ambiguous, Vec::new())
         }
@@ -145,7 +202,7 @@ pub async fn identify(
         visitor_id,
         f,
         raw,
-        client_ip,
+        req,
         best.as_ref().map(|c| c.score).unwrap_or(0.0),
         match_kind,
     )
@@ -161,8 +218,29 @@ pub async fn identify(
         candidates: scored.into_iter().take(5).collect(),
         drift,
         observation_count: count,
+        via_persistence: false,
     })
 }
+
+const SIG_COLUMNS: &str = "visitor_id, canonical_ua_hash, math_fp_hash, webgl_params_hash,
+    webgl_render_hash, canvas_hash, audio_hash, audio_stable_checksum,
+    speech_voices_hash, fonts_sorted_hash, dom_rect_hash,
+    screen_w, screen_h, device_pixel_ratio, hw_concurrency,
+    timezone, locale, device_model, system_rom, system_version,
+    in_app_version_code, android_build,
+    client_visitor_id, battery_charging, battery_level, storage_quota_bytes,
+    ua_architecture, ua_model, ua_platform_version, webrtc_public_ips";
+
+const SIG_SELECT_BY_BUCKET: &str = const_format::concatcp!(
+    "SELECT ",
+    SIG_COLUMNS,
+    " FROM signatures WHERE bucket_key = $1 LIMIT $2"
+);
+const SIG_SELECT_BY_CLIENT_ID: &str = const_format::concatcp!(
+    "SELECT ",
+    SIG_COLUMNS,
+    " FROM signatures WHERE client_visitor_id = $1 LIMIT 1"
+);
 
 #[derive(sqlx::FromRow)]
 #[allow(dead_code)]
@@ -189,6 +267,14 @@ struct SignatureRow {
     system_version: Option<String>,
     in_app_version_code: Option<String>,
     android_build: Option<String>,
+    client_visitor_id: Option<String>,
+    battery_charging: Option<bool>,
+    battery_level: Option<f64>,
+    storage_quota_bytes: Option<i64>,
+    ua_architecture: Option<String>,
+    ua_model: Option<String>,
+    ua_platform_version: Option<String>,
+    webrtc_public_ips: Option<Vec<String>>,
 }
 
 impl SignatureRow {
@@ -216,6 +302,14 @@ impl SignatureRow {
             system_version: self.system_version.clone(),
             in_app_version_code: self.in_app_version_code.clone(),
             android_build: self.android_build.clone(),
+            client_visitor_id: self.client_visitor_id.clone(),
+            battery_charging: self.battery_charging,
+            battery_level: self.battery_level,
+            storage_quota_bytes: self.storage_quota_bytes,
+            ua_architecture: self.ua_architecture.clone(),
+            ua_model: self.ua_model.clone(),
+            ua_platform_version: self.ua_platform_version.clone(),
+            webrtc_public_ips: self.webrtc_public_ips.clone().unwrap_or_default(),
         }
     }
 }
@@ -250,6 +344,9 @@ fn compute_drift_against_db(
     if !same_str_opt(&row.in_app_version_code, &f.in_app_version_code) {
         drift.push("in_app_version_code");
     }
+    if row.webrtc_public_ips.as_deref().unwrap_or(&[]) != f.webrtc_public_ips.as_slice() {
+        drift.push("webrtc_public_ips");
+    }
     drift
 }
 
@@ -283,7 +380,12 @@ async fn create_visitor(
             hw_concurrency, device_memory, max_touch_points, timezone, locale,
             language_tag, in_app, in_app_version, in_app_version_code,
             wechat_platform, device_vendor, system_rom, system_version,
-            device_model, android_build, ua_consistent, updated_at
+            device_model, android_build, ua_consistent,
+            client_visitor_id, battery_charging, battery_level,
+            storage_quota_bytes, storage_usage_bytes,
+            ua_architecture, ua_bitness, ua_model, ua_platform_version, ua_full_version,
+            webrtc_public_ips, webrtc_local_ips,
+            updated_at
            )
            VALUES (
             $1, $2, $3, $4,
@@ -293,7 +395,12 @@ async fn create_visitor(
             $17, $18, $19, $20, $21,
             $22, $23, $24, $25,
             $26, $27, $28, $29,
-            $30, $31, $32, now()
+            $30, $31, $32,
+            $33, $34, $35,
+            $36, $37,
+            $38, $39, $40, $41, $42,
+            $43, $44,
+            now()
            )"#,
     )
     .bind(id)
@@ -328,6 +435,18 @@ async fn create_visitor(
     .bind(&f.device_model)
     .bind(&f.android_build)
     .bind(f.ua_consistent)
+    .bind(&f.client_visitor_id)
+    .bind(f.battery_charging)
+    .bind(f.battery_level)
+    .bind(f.storage_quota_bytes)
+    .bind(f.storage_usage_bytes)
+    .bind(&f.ua_architecture)
+    .bind(&f.ua_bitness)
+    .bind(&f.ua_model)
+    .bind(&f.ua_platform_version)
+    .bind(&f.ua_full_version)
+    .bind(&f.webrtc_public_ips)
+    .bind(&f.webrtc_local_ips)
     .execute(&mut **tx)
     .await
     .context("inserting signature")?;
@@ -361,6 +480,14 @@ async fn update_signature(
             system_version = COALESCE($18, system_version),
             in_app_version_code = COALESCE($19, in_app_version_code),
             android_build = COALESCE($20, android_build),
+            client_visitor_id = COALESCE($21, client_visitor_id),
+            battery_charging = COALESCE($22, battery_charging),
+            battery_level = COALESCE($23, battery_level),
+            storage_quota_bytes = COALESCE($24, storage_quota_bytes),
+            ua_architecture = COALESCE($25, ua_architecture),
+            ua_model = COALESCE($26, ua_model),
+            ua_platform_version = COALESCE($27, ua_platform_version),
+            webrtc_public_ips = COALESCE($28, webrtc_public_ips),
             updated_at = now()
            WHERE visitor_id = $1"#,
     )
@@ -384,6 +511,18 @@ async fn update_signature(
     .bind(&f.system_version)
     .bind(&f.in_app_version_code)
     .bind(&f.android_build)
+    .bind(&f.client_visitor_id)
+    .bind(f.battery_charging)
+    .bind(f.battery_level)
+    .bind(f.storage_quota_bytes)
+    .bind(&f.ua_architecture)
+    .bind(&f.ua_model)
+    .bind(&f.ua_platform_version)
+    .bind(if f.webrtc_public_ips.is_empty() {
+        None
+    } else {
+        Some(&f.webrtc_public_ips)
+    })
     .execute(&mut **tx)
     .await
     .context("updating signature")?;
@@ -411,7 +550,7 @@ async fn insert_observation(
     visitor_id: Uuid,
     f: &Features,
     raw: &serde_json::Value,
-    ip: IpAddr,
+    req: &RequestContext,
     score: f64,
     kind: MatchKind,
 ) -> Result<()> {
@@ -421,27 +560,36 @@ async fn insert_observation(
         MatchKind::Ambiguous => "ambiguous",
         MatchKind::New => "new",
     };
+    let ip = req.ip.clone().unwrap_or_else(|| "0.0.0.0".to_string());
     sqlx::query(
         r#"INSERT INTO observations (
             visitor_id, observed_at, bucket_key, match_score, match_kind,
-            ip_address, user_agent, raw_features
+            ip_address, user_agent, raw_features,
+            request_user_agent, request_accept_language, request_sec_ch_ua,
+            request_sec_ch_ua_platform, request_referer, request_dnt
            )
-           VALUES ($1, now(), $2, $3, $4, $5::inet, $6, $7)"#,
+           VALUES (
+            $1, now(), $2, $3, $4,
+            $5::inet, $6, $7,
+            $8, $9, $10,
+            $11, $12, $13
+           )"#,
     )
     .bind(visitor_id)
     .bind(&f.bucket_key)
     .bind(score)
     .bind(kind_str)
-    .bind(ip.to_string())
+    .bind(ip)
     .bind(&f.user_agent)
     .bind(SqlxJson(raw))
+    .bind(&req.user_agent)
+    .bind(&req.accept_language)
+    .bind(&req.sec_ch_ua)
+    .bind(&req.sec_ch_ua_platform)
+    .bind(&req.referer)
+    .bind(req.dnt)
     .execute(&mut **tx)
     .await
     .context("inserting observation")?;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn _utc_now() -> chrono::DateTime<Utc> {
-    Utc::now()
 }

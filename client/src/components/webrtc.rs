@@ -5,15 +5,17 @@ use serde::Serialize;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{RtcPeerConnection, RtcSessionDescriptionInit};
+use web_sys::{RtcConfiguration, RtcPeerConnection, RtcSessionDescriptionInit};
 
 #[derive(Serialize)]
 pub struct WebrtcFp {
     pub local_ips: Vec<String>,
     pub local_ipv6: Vec<String>,
+    /// Public IP captured via STUN srflx/prflx candidates — survives most VPNs
+    /// because STUN is UDP and many split-tunnel configs leak it.
+    pub public_ips: Vec<String>,
     pub mdns_hosts: Vec<String>,
     pub candidate_count: u32,
-    /// Whether the gathering finished within our timeout window.
     pub completed: bool,
 }
 
@@ -22,7 +24,22 @@ pub async fn collect() -> Option<WebrtcFp> {
 }
 
 async fn try_collect() -> Result<WebrtcFp, JsValue> {
-    let pc = RtcPeerConnection::new()?;
+    let config = RtcConfiguration::new();
+    let ice_servers = js_sys::Array::new();
+    for url in [
+        "stun:stun.l.google.com:19302",
+        "stun:stun.miwifi.com:3478",
+        "stun:stun.qq.com:3478",
+    ] {
+        let server = js_sys::Object::new();
+        let urls = js_sys::Array::new();
+        urls.push(&JsValue::from_str(url));
+        let _ = js_sys::Reflect::set(&server, &"urls".into(), &urls);
+        ice_servers.push(&server);
+    }
+    let _ = js_sys::Reflect::set(config.as_ref(), &"iceServers".into(), &ice_servers);
+
+    let pc = RtcPeerConnection::new_with_configuration(&config)?;
     let _ = pc.create_data_channel("inf-fp");
 
     let raw: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -36,7 +53,6 @@ async fn try_collect() -> Result<WebrtcFp, JsValue> {
             Err(_) => return,
         };
         if cand.is_null() || cand.is_undefined() {
-            // null candidate signals end-of-gathering
             *completed_cb.borrow_mut() = true;
             return;
         }
@@ -55,7 +71,8 @@ async fn try_collect() -> Result<WebrtcFp, JsValue> {
     let offer_init: RtcSessionDescriptionInit = offer.unchecked_into();
     JsFuture::from(pc.set_local_description(&offer_init)).await?;
 
-    sleep_ms(800).await?;
+    // STUN round-trip can take 600-1500ms on real networks.
+    sleep_ms(1500).await?;
     pc.close();
 
     let raw_candidates: Vec<String> = raw.borrow().clone();
@@ -64,27 +81,39 @@ async fn try_collect() -> Result<WebrtcFp, JsValue> {
 
     let mut local_ipv4: Vec<String> = Vec::new();
     let mut local_ipv6: Vec<String> = Vec::new();
+    let mut public_ips: Vec<String> = Vec::new();
     let mut mdns_hosts: Vec<String> = Vec::new();
 
     for c in &raw_candidates {
-        if let Some(addr) = parse_address(c) {
-            if addr.ends_with(".local") {
-                if !mdns_hosts.contains(&addr) {
-                    mdns_hosts.push(addr);
-                }
-            } else if addr.contains(':') {
-                if !local_ipv6.contains(&addr) {
-                    local_ipv6.push(addr);
-                }
-            } else if !local_ipv4.contains(&addr) {
-                local_ipv4.push(addr);
+        let kind = candidate_type(c);
+        let Some(addr) = parse_address(c) else {
+            continue;
+        };
+        if addr.ends_with(".local") {
+            if !mdns_hosts.contains(&addr) {
+                mdns_hosts.push(addr);
             }
+            continue;
+        }
+        if matches!(kind.as_deref(), Some("srflx") | Some("prflx")) {
+            if !public_ips.contains(&addr) {
+                public_ips.push(addr);
+            }
+            continue;
+        }
+        if addr.contains(':') {
+            if !local_ipv6.contains(&addr) {
+                local_ipv6.push(addr);
+            }
+        } else if !local_ipv4.contains(&addr) {
+            local_ipv4.push(addr);
         }
     }
 
     Ok(WebrtcFp {
         local_ips: local_ipv4,
         local_ipv6,
+        public_ips,
         mdns_hosts,
         candidate_count: raw_candidates.len() as u32,
         completed: done,
@@ -92,9 +121,19 @@ async fn try_collect() -> Result<WebrtcFp, JsValue> {
 }
 
 /// Candidate format: `candidate:0 1 UDP 2122252543 192.168.1.5 53345 typ host`
-/// Address is the 5th whitespace-separated field.
+/// Address is field index 4; type follows the `typ` keyword.
 fn parse_address(candidate: &str) -> Option<String> {
     candidate.split_whitespace().nth(4).map(|s| s.to_string())
+}
+
+fn candidate_type(candidate: &str) -> Option<String> {
+    let mut parts = candidate.split_whitespace();
+    while let Some(p) = parts.next() {
+        if p == "typ" {
+            return parts.next().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 async fn sleep_ms(ms: i32) -> Result<(), JsValue> {

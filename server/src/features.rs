@@ -48,6 +48,28 @@ pub struct Features {
 
     pub ua_consistent: Option<bool>,
     pub user_agent: Option<String>,
+
+    // Persistence super-cookie. Strongest single signal when present + verified.
+    pub client_visitor_id: Option<String>,
+
+    // Battery (Chromium / X5 / XWEB; absent on iOS Safari).
+    pub battery_charging: Option<bool>,
+    pub battery_level: Option<f64>,
+
+    // StorageManager.estimate() — quota fairly stable per device.
+    pub storage_quota_bytes: Option<i64>,
+    pub storage_usage_bytes: Option<i64>,
+
+    // UA Client Hints high-entropy (Chromium async API).
+    pub ua_architecture: Option<String>,
+    pub ua_bitness: Option<String>,
+    pub ua_model: Option<String>,
+    pub ua_platform_version: Option<String>,
+    pub ua_full_version: Option<String>,
+
+    // WebRTC IPs.
+    pub webrtc_public_ips: Vec<String>,
+    pub webrtc_local_ips: Vec<String>,
 }
 
 impl Features {
@@ -134,6 +156,42 @@ impl Features {
         let ua_consistent = integrity.and_then(|i| i.get("ua_consistent")?.as_bool());
         let user_agent = string_at(china, "user_agent");
 
+        // New: persistence + battery + storage + UA-hints + webrtc public IP.
+        let persist = components.get("persist");
+        let battery = components.get("battery");
+        let storage_quota = components.get("storage_quota");
+        let ua_high = components.get("ua_high");
+        let webrtc = components.get("webrtc");
+
+        let client_visitor_id = persist.and_then(|p| string_at(p, "client_visitor_id"));
+        let battery_charging = battery.and_then(|b| b.get("charging")?.as_bool());
+        let battery_level = battery.and_then(|b| b.get("level")?.as_f64());
+        let storage_quota_bytes = storage_quota
+            .and_then(|s| s.get("quota_bytes")?.as_f64())
+            .map(|v| v as i64);
+        let storage_usage_bytes = storage_quota
+            .and_then(|s| s.get("usage_bytes")?.as_f64())
+            .map(|v| v as i64);
+
+        let ua_architecture = ua_high.and_then(|u| string_at(u, "architecture"));
+        let ua_bitness = ua_high.and_then(|u| string_at(u, "bitness"));
+        let ua_model = ua_high.and_then(|u| string_at(u, "model"));
+        let ua_platform_version = ua_high.and_then(|u| string_at(u, "platform_version"));
+        let ua_full_version = ua_high.and_then(|u| string_at(u, "ua_full_version"));
+
+        let extract_str_array = |key: &str| -> Vec<String> {
+            webrtc
+                .and_then(|w| w.get(key)?.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let webrtc_public_ips = extract_str_array("public_ips");
+        let webrtc_local_ips = extract_str_array("local_ips");
+
         let bucket_key = compute_bucket_key(
             &canonical_ua_hash,
             screen_w,
@@ -179,6 +237,18 @@ impl Features {
             android_build,
             ua_consistent,
             user_agent,
+            client_visitor_id,
+            battery_charging,
+            battery_level,
+            storage_quota_bytes,
+            storage_usage_bytes,
+            ua_architecture,
+            ua_bitness,
+            ua_model,
+            ua_platform_version,
+            ua_full_version,
+            webrtc_public_ips,
+            webrtc_local_ips,
         })
     }
 }
