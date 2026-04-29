@@ -1,0 +1,15 @@
+# Boost native x86_64 Linux builds with the v3 ISA baseline (AVX2 + BMI2,
+# universally supported on any 2014+ Intel/AMD CPU). This is what the server
+# binary in CI / Docker compiles to. Macs (aarch64-apple-darwin) and the
+# WASM client (wasm32-unknown-unknown) target other architectures and so are
+# not affected by these flags.
+#
+# The deploy host (Intel Xeon 6986P-C, Sapphire Rapids) supports AVX-512 too,
+# but v3 is enough to pick up the SIMD wins on xxh3 / msgpack hot paths
+# without locking the binary to bleeding-edge silicon.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
