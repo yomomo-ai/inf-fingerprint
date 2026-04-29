@@ -3,8 +3,17 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/inf-fingerprint-server
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -22,8 +31,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p inf-fingerprint --target wasm32-unknown-unknown -- -D warnings
-      - run: cargo test -p inf-fingerprint --lib china::tests
-      - run: cargo test -p inf-fingerprint-server
+      - run: cargo test --workspace
 
   client:
     runs-on: ubuntu-latest
@@ -55,20 +63,77 @@ jobs:
         with:
           name: pkg
           path: client/pkg/
+          retention-days: 7
 
-  server:
+  publish-npm:
+    runs-on: ubuntu-latest
+    needs: client
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pkg
+          path: pkg
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify package version matches tag
+        run: |
+          PKG_VERSION=$(node -p "require('./pkg/package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::package.json version $PKG_VERSION does not match tag $TAG_VERSION"
+            echo "::error::bump Cargo.toml [package].version to $TAG_VERSION before tagging"
+            exit 1
+          fi
+          echo "Publishing $PKG_VERSION"
+
+      - run: npm publish --access public
+        working-directory: pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  server-image:
     runs-on: ubuntu-latest
     needs: check
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: docker/setup-buildx-action@v3
 
-      - uses: Swatinem/rust-cache@v2
-
-      - run: cargo build --release -p inf-fingerprint-server
-
-      - uses: actions/upload-artifact@v4
+      - uses: docker/login-action@v3
         with:
-          name: server-binary
-          path: target/release/inf-fingerprint-server
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

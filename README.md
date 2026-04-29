@@ -143,6 +143,34 @@ cargo test -p inf-fingerprint --lib china::tests
 wasm-pack build client --target web --release
 ```
 
+## Releasing
+
+The `.github/workflows/build.yml` workflow handles publishing on every push:
+
+- Pushes to `main` build the server image and push it to
+  `ghcr.io/yomomo-ai/inf-fingerprint-server` with tags `latest`, `main`, and
+  the short SHA.
+- Tag pushes matching `v*` (e.g. `v0.2.0`) additionally publish the WASM
+  client to npm. The tag version must match `Cargo.toml [package].version`
+  in `client/Cargo.toml` — the workflow fails if they drift.
+
+Cutting a release:
+
+```bash
+# 1. bump version
+$EDITOR client/Cargo.toml          # set [package].version = "0.2.0"
+cargo update -p inf-fingerprint --precise 0.2.0
+git commit -am "bump client to 0.2.0"
+git push
+
+# 2. tag and push
+git tag v0.2.0
+git push --tags
+```
+
+GitHub Actions then builds, publishes `ghcr.io/yomomo-ai/inf-fingerprint-server:0.2.0`,
+and pushes `inf-fingerprint@0.2.0` to npm.
+
 ## License
 
 MIT.
