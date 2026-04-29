@@ -11,13 +11,27 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Run `wasm-opt -Oz` on pkg/*.wasm separately if size matters; binaryen download
-# from GitHub is flaky on mainland networks so wasm-pack auto-invocation is off.
+# wasm-opt for size + perf. Feature flags must match what rustc emits — modern
+# rustc produces wasm with nontrapping-float-to-int and sign-ext by default.
+# binaryen is auto-downloaded from GitHub release; needs network reach.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = [
+    "-O3",
+    "--enable-bulk-memory",
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+    "--enable-reference-types",
+]
 
 [package.metadata.wasm-pack.profile.profiling]
-wasm-opt = false
+wasm-opt = [
+    "-O",
+    "--enable-bulk-memory",
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+    "--enable-sign-ext",
+]
 
 [features]
 default = ["panic_hook"]
@@ -97,5 +111,13 @@ features = [
     "FontFace",
     "SvgsvgElement",
     "SvgPathElement",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "RequestCredentials",
+    "Headers",
+    "Response",
+    "AbortController",
+    "AbortSignal",
     "console",
 ]
