@@ -111,11 +111,16 @@ docker build -t inf-fingerprint-server:0.1.0 -f server/Dockerfile .
 
 docker run -d \
   --name inf-fp \
-  -p 8080:8080 \
+  -p 28091:28091 \
+  --add-host=host.docker.internal:host-gateway \
   -v /etc/inf-fp/config.toml:/app/config.toml:ro \
   --restart=unless-stopped \
   inf-fingerprint-server:0.1.0
 ```
+
+`--add-host=host.docker.internal:host-gateway` lets the container reach the
+Postgres at the host's IP if you're running PG outside Docker. On macOS /
+Windows it's a no-op (already resolves).
 
 ## Develop
 

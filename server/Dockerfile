@@ -21,6 +21,6 @@ WORKDIR /app
 COPY --from=builder /build/target/release/inf-fingerprint-server /usr/local/bin/inf-fingerprint-server
 
 USER app
-EXPOSE 8080
+EXPOSE 28091
 ENV INF_FP_CONFIG=/app/config.toml
 CMD ["/usr/local/bin/inf-fingerprint-server"]
