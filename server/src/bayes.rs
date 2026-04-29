@@ -416,7 +416,7 @@ mod tests {
     fn feat() -> Features {
         Features {
             canonical_ua_hash: "ua-1".into(),
-            bucket_key: vec![],
+            bucket_recall_keys: vec![],
             math_fp_hash: Some("math-1".into()),
             webgl_params_hash: Some("p-1".into()),
             webgl_render_hash: Some("r-1".into()),

@@ -6,10 +6,26 @@
 use serde_json::Value;
 use xxhash_rust::xxh3::Xxh3;
 
+/// Recall-bucket dimensions. Each is an *independent* high-stability,
+/// high-cardinality feature — a signature is indexed under every dimension
+/// it has a value for, and a candidate matches if ANY single dimension
+/// agrees with the request. Bayes does the actual scoring with the full
+/// feature set; bucketing is pure recall optimization, not discrimination.
+///
+/// These constants must match the `bucket_kind` values in migration
+/// `0003_signature_recall_buckets.sql`.
+pub const BUCKET_KIND_CANVAS: i16 = 0;
+pub const BUCKET_KIND_WEBGL_RENDER: i16 = 1;
+pub const BUCKET_KIND_WEBGL_PARAMS: i16 = 2;
+pub const BUCKET_KIND_FONTS: i16 = 3;
+pub const BUCKET_KIND_AUDIO: i16 = 4;
+
 #[derive(Debug, Clone)]
 pub struct Features {
     pub canonical_ua_hash: String,
-    pub bucket_key: Vec<u8>,
+    /// Recall hooks: `(bucket_kind, hex_hash_string)` pairs. Sent to the
+    /// matcher's multi-bucket lookup as a UNION over all dimensions.
+    pub bucket_recall_keys: Vec<(i16, String)>,
 
     pub math_fp_hash: Option<String>,
     pub webgl_params_hash: Option<String>,
@@ -192,18 +208,17 @@ impl Features {
         let webrtc_public_ips = extract_str_array("public_ips");
         let webrtc_local_ips = extract_str_array("local_ips");
 
-        let bucket_key = compute_bucket_key(
-            &canonical_ua_hash,
-            screen_w,
-            screen_h,
-            device_pixel_ratio,
-            hw_concurrency,
-            math_fp_hash.as_deref(),
+        let bucket_recall_keys = compute_bucket_recall_keys(
+            canvas_hash.as_deref(),
+            webgl_render_hash.as_deref(),
+            webgl_params_hash.as_deref(),
+            fonts_sorted_hash.as_deref(),
+            audio_hash.as_deref(),
         );
 
         Some(Features {
             canonical_ua_hash,
-            bucket_key,
+            bucket_recall_keys,
             math_fp_hash,
             webgl_params_hash,
             webgl_render_hash,
@@ -261,28 +276,40 @@ fn hash_string(s: &str) -> String {
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(s.as_bytes()))
 }
 
-fn compute_bucket_key(
-    canonical_ua_hash: &str,
-    screen_w: Option<i32>,
-    screen_h: Option<i32>,
-    dpr: Option<f64>,
-    hw_concurrency: Option<f64>,
-    math_fp_hash: Option<&str>,
-) -> Vec<u8> {
+fn compute_bucket_recall_keys(
+    canvas_hash: Option<&str>,
+    webgl_render_hash: Option<&str>,
+    webgl_params_hash: Option<&str>,
+    fonts_sorted_hash: Option<&str>,
+    audio_hash: Option<&str>,
+) -> Vec<(i16, String)> {
+    let mut keys = Vec::with_capacity(5);
+    let mut push = |kind: i16, v: Option<&str>| {
+        if let Some(s) = v {
+            if !s.is_empty() {
+                keys.push((kind, s.to_string()));
+            }
+        }
+    };
+    push(BUCKET_KIND_CANVAS, canvas_hash);
+    push(BUCKET_KIND_WEBGL_RENDER, webgl_render_hash);
+    push(BUCKET_KIND_WEBGL_PARAMS, webgl_params_hash);
+    push(BUCKET_KIND_FONTS, fonts_sorted_hash);
+    push(BUCKET_KIND_AUDIO, audio_hash);
+    keys
+}
+
+/// Cache key for the bucket-cache map. Same set of recall keys (regardless
+/// of order) → same cache hit. Different recall keys → different cache slot.
+pub fn recall_cache_key(keys: &[(i16, String)]) -> Vec<u8> {
+    let mut sorted: Vec<&(i16, String)> = keys.iter().collect();
+    sorted.sort();
     let mut h = Xxh3::new();
-    h.update(canonical_ua_hash.as_bytes());
-    h.update(b"|");
-    if let (Some(w), Some(ht), Some(d)) = (screen_w, screen_h, dpr) {
-        h.update(format!("{}x{}@{}", w, ht, d).as_bytes());
+    for (kind, value) in sorted {
+        h.update(&kind.to_le_bytes());
+        h.update(b":");
+        h.update(value.as_bytes());
+        h.update(b"|");
     }
-    h.update(b"|");
-    if let Some(hc) = hw_concurrency {
-        h.update(format!("{}", hc as i32).as_bytes());
-    }
-    h.update(b"|");
-    if let Some(m) = math_fp_hash {
-        h.update(m.as_bytes());
-    }
-    let n = h.digest128();
-    n.to_le_bytes().to_vec()
+    h.digest128().to_le_bytes().to_vec()
 }

@@ -6,11 +6,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::bayes;
-use crate::features::Features;
+use crate::features::{recall_cache_key, Features};
 
-/// In-memory bucket cache. Each entry is the candidate signatures for one
-/// bucket_key, valid for 60s. Hot buckets (popular iPhone+WeChat combos) hit
-/// the cache 99%+ of the time and never touch the DB on the read path.
+/// In-memory recall-bucket cache. Keyed by a hash of the request's recall
+/// keys (canvas/webgl_render/webgl_params/fonts/audio), value is the
+/// candidate signatures the multi-bucket UNION returned. Hot recall-key
+/// sets (popular iPhone+WeChat combos) hit the cache 99%+ of the time
+/// and skip the DB read path entirely.
 pub type BucketCache = Arc<moka::future::Cache<Vec<u8>, Arc<Vec<SignatureRow>>>>;
 
 pub fn new_bucket_cache(capacity: u64, ttl_seconds: u64) -> BucketCache {
@@ -139,8 +141,11 @@ pub async fn identify(
                     MatchKind::Ambiguous
                 };
                 insert_observation(&mut tx, sig.visitor_id, f, raw, req, s.total, kind).await?;
+                refresh_signature_buckets(&mut tx, sig.visitor_id, &f.bucket_recall_keys).await?;
                 tx.commit().await?;
-                cache.invalidate(&f.bucket_key).await;
+                cache
+                    .invalidate(&recall_cache_key(&f.bucket_recall_keys))
+                    .await;
                 return Ok(Outcome {
                     visitor_id: sig.visitor_id,
                     match_kind: kind,
@@ -163,18 +168,29 @@ pub async fn identify(
         }
     }
 
-    // Bucket scan with cache.
-    let candidates: Vec<SignatureRow> = if let Some(cached) = cache.get(&f.bucket_key).await {
+    // Multi-bucket recall: any signature whose stored recall keys overlap
+    // with the request's keys on at least one dimension is a candidate.
+    // No single feature can veto candidacy — that's Bayes's job downstream.
+    let cache_key = recall_cache_key(&f.bucket_recall_keys);
+    let candidates: Vec<SignatureRow> = if let Some(cached) = cache.get(&cache_key).await {
         (*cached).clone()
     } else {
-        let fresh = sqlx::query_as::<_, SignatureRow>(SIG_SELECT_BY_BUCKET)
-            .bind(&f.bucket_key)
-            .bind(max_candidates as i64)
-            .fetch_all(pool)
-            .await
-            .context("fetching bucket candidates")?;
+        let (kinds, values): (Vec<i16>, Vec<String>) = f.bucket_recall_keys.iter().cloned().unzip();
+        let fresh = if kinds.is_empty() {
+            // No recall keys at all (request missing every bucketed feature)
+            // → no candidates. This is fine; the request will be a fresh visitor.
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, SignatureRow>(SIG_SELECT_BY_RECALL)
+                .bind(&kinds)
+                .bind(&values)
+                .bind(max_candidates as i64)
+                .fetch_all(pool)
+                .await
+                .context("fetching recall candidates")?
+        };
         cache
-            .insert(f.bucket_key.clone(), Arc::new(fresh.clone()))
+            .insert(cache_key.clone(), Arc::new(fresh.clone()))
             .await;
         fresh
     };
@@ -236,9 +252,11 @@ pub async fn identify(
     .await?;
 
     tx.commit().await?;
-    // Bucket cache is invalidated whether we updated an existing signature
-    // (data drift) or created a new one (new entry in the bucket).
-    cache.invalidate(&f.bucket_key).await;
+    // Cache is invalidated whether we updated an existing signature (data
+    // drift) or created a new one (new entry the cached candidate list
+    // would have missed). 60s TTL on other entries handles cross-bucket
+    // staleness conservatively.
+    cache.invalidate(&cache_key).await;
 
     Ok(Outcome {
         visitor_id,
@@ -261,10 +279,19 @@ const SIG_COLUMNS: &str = "visitor_id, canonical_ua_hash, math_fp_hash, webgl_pa
     client_visitor_id, battery_charging, battery_level, storage_quota_bytes,
     ua_architecture, ua_model, ua_platform_version, webrtc_public_ips";
 
-const SIG_SELECT_BY_BUCKET: &str = const_format::concatcp!(
+// Multi-bucket UNION lookup: a signature is a candidate if any of its
+// indexed recall keys matches any of the request's recall keys. Bayes does
+// the discrimination downstream — bucketing only narrows the search space.
+const SIG_SELECT_BY_RECALL: &str = const_format::concatcp!(
     "SELECT ",
     SIG_COLUMNS,
-    " FROM signatures WHERE bucket_key = $1 LIMIT $2"
+    " FROM signatures WHERE visitor_id IN (
+         SELECT DISTINCT sb.visitor_id
+         FROM signature_buckets sb
+         JOIN unnest($1::smallint[], $2::text[]) AS t(kind, value)
+              ON sb.bucket_kind = t.kind AND sb.bucket_value = t.value
+         LIMIT $3
+     )"
 );
 const SIG_SELECT_BY_CLIENT_ID: &str = const_format::concatcp!(
     "SELECT ",
@@ -403,7 +430,7 @@ async fn create_visitor(
 
     sqlx::query(
         r#"INSERT INTO signatures (
-            visitor_id, bucket_key, canonical_ua_hash, math_fp_hash,
+            visitor_id, canonical_ua_hash, math_fp_hash,
             webgl_params_hash, webgl_render_hash, canvas_hash, audio_hash,
             audio_stable_checksum, speech_voices_hash, fonts_sorted_hash,
             dom_rect_hash, screen_w, screen_h, device_pixel_ratio, color_depth,
@@ -418,23 +445,22 @@ async fn create_visitor(
             updated_at
            )
            VALUES (
-            $1, $2, $3, $4,
-            $5, $6, $7, $8,
-            $9, $10, $11,
-            $12, $13, $14, $15, $16,
-            $17, $18, $19, $20, $21,
-            $22, $23, $24, $25,
-            $26, $27, $28, $29,
-            $30, $31, $32,
-            $33, $34, $35,
-            $36, $37,
-            $38, $39, $40, $41, $42,
-            $43, $44,
+            $1, $2, $3,
+            $4, $5, $6, $7,
+            $8, $9, $10,
+            $11, $12, $13, $14, $15,
+            $16, $17, $18, $19, $20,
+            $21, $22, $23, $24,
+            $25, $26, $27, $28,
+            $29, $30, $31,
+            $32, $33, $34,
+            $35, $36,
+            $37, $38, $39, $40, $41,
+            $42, $43,
             now()
            )"#,
     )
     .bind(id)
-    .bind(&f.bucket_key)
     .bind(&f.canonical_ua_hash)
     .bind(&f.math_fp_hash)
     .bind(&f.webgl_params_hash)
@@ -481,7 +507,43 @@ async fn create_visitor(
     .await
     .context("inserting signature")?;
 
+    refresh_signature_buckets(tx, id, &f.bucket_recall_keys).await?;
+
     Ok(id)
+}
+
+/// Replace the recall-bucket index for a visitor. Used both on signature
+/// creation and on signature update (when the user's recall features
+/// drift, e.g. browser upgrade changes canvas_hash, the index needs to
+/// reflect the new values).
+async fn refresh_signature_buckets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    visitor_id: Uuid,
+    keys: &[(i16, String)],
+) -> Result<()> {
+    sqlx::query("DELETE FROM signature_buckets WHERE visitor_id = $1")
+        .bind(visitor_id)
+        .execute(&mut **tx)
+        .await
+        .context("clearing signature_buckets")?;
+
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let (kinds, values): (Vec<i16>, Vec<String>) = keys.iter().cloned().unzip();
+    sqlx::query(
+        r#"INSERT INTO signature_buckets (visitor_id, bucket_kind, bucket_value)
+           SELECT $1, kind, value
+             FROM unnest($2::smallint[], $3::text[]) AS t(kind, value)
+           ON CONFLICT DO NOTHING"#,
+    )
+    .bind(visitor_id)
+    .bind(&kinds)
+    .bind(&values)
+    .execute(&mut **tx)
+    .await
+    .context("inserting signature_buckets")?;
+    Ok(())
 }
 
 async fn update_signature(
@@ -556,6 +618,14 @@ async fn update_signature(
     .execute(&mut **tx)
     .await
     .context("updating signature")?;
+
+    // Recall-bucket index has to follow the signature's recall features.
+    // If e.g. canvas_hash drifted on a browser upgrade, the old canvas
+    // bucket entry would still resolve this visitor as a candidate for
+    // requests with the new canvas, but never the other way round, so
+    // refresh wholesale.
+    refresh_signature_buckets(tx, visitor_id, &f.bucket_recall_keys).await?;
+
     Ok(())
 }
 
@@ -593,20 +663,19 @@ async fn insert_observation(
     let ip = req.ip.clone().unwrap_or_else(|| "0.0.0.0".to_string());
     sqlx::query(
         r#"INSERT INTO observations (
-            visitor_id, observed_at, bucket_key, match_score, match_kind,
+            visitor_id, observed_at, match_score, match_kind,
             ip_address, user_agent, raw_features,
             request_user_agent, request_accept_language, request_sec_ch_ua,
             request_sec_ch_ua_platform, request_referer, request_dnt
            )
            VALUES (
-            $1, now(), $2, $3, $4,
-            $5::inet, $6, $7,
-            $8, $9, $10,
-            $11, $12, $13
+            $1, now(), $2, $3,
+            $4::inet, $5, $6,
+            $7, $8, $9,
+            $10, $11, $12
            )"#,
     )
     .bind(visitor_id)
-    .bind(&f.bucket_key)
     .bind(score)
     .bind(kind_str)
     .bind(ip)
