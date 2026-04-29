@@ -145,31 +145,28 @@ wasm-pack build client --target web --release
 
 ## Releasing
 
-The `.github/workflows/build.yml` workflow handles publishing on every push:
+`.github/workflows/build.yml` is path-aware: each push to `main` only
+publishes the parts that actually changed.
 
-- Pushes to `main` build the server image and push it to
-  `ghcr.io/yomomo-ai/inf-fingerprint-server` with tags `latest`, `main`, and
-  the short SHA.
-- Tag pushes matching `v*` (e.g. `v0.2.0`) additionally publish the WASM
-  client to npm. The tag version must match `Cargo.toml [package].version`
-  in `client/Cargo.toml` — the workflow fails if they drift.
+- Touching `client/**` triggers a wasm-pack build and a conditional
+  `npm publish` of the package version in `client/Cargo.toml`. If that
+  version is already on npm the publish step no-ops with a notice; bump
+  `[package].version` to ship a new release.
+- Touching `server/**` (or anything the Dockerfile reads) triggers a docker
+  build and pushes `ghcr.io/yomomo-ai/inf-fingerprint-server` tagged with
+  `latest`, `main`, and the short SHA.
 
-Cutting a release:
+Cutting a client release:
 
 ```bash
-# 1. bump version
 $EDITOR client/Cargo.toml          # set [package].version = "0.2.0"
 cargo update -p inf-fingerprint --precise 0.2.0
 git commit -am "bump client to 0.2.0"
 git push
-
-# 2. tag and push
-git tag v0.2.0
-git push --tags
 ```
 
-GitHub Actions then builds, publishes `ghcr.io/yomomo-ai/inf-fingerprint-server:0.2.0`,
-and pushes `inf-fingerprint@0.2.0` to npm.
+Server changes ship as soon as you push to `main` — the image always tracks
+HEAD via the `latest` and `<sha>` tags.
 
 ## License
 
