@@ -74,6 +74,14 @@ impl Fingerprint {
     pub fn to_json(&self) -> Result<JsValue, JsValue> {
         serde_wasm_bindgen::to_value(&self.inner).map_err(|e| JsValue::from_str(&e.to_string()))
     }
+
+    /// Internal: msgpack bytes for fast wire encoding. Skips the JS bridge
+    /// entirely (no serde-wasm-bindgen, no JSON.stringify), encoding directly
+    /// from the Rust struct in WASM linear memory.
+    pub(crate) fn to_msgpack(&self) -> Result<Vec<u8>, JsValue> {
+        rmp_serde::to_vec_named(&self.inner)
+            .map_err(|e| JsValue::from_str(&format!("msgpack encode: {}", e)))
+    }
 }
 
 #[wasm_bindgen(js_name = getFingerprint)]

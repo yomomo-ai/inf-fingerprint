@@ -1,6 +1,8 @@
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -72,11 +74,17 @@ async fn identify(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(body): Json<serde_json::Value>,
-) -> ApiResult<Json<IdentifyResponse>> {
+    body: Bytes,
+) -> ApiResult<Response> {
     check_api_key(&state, &headers)?;
 
-    let features = Features::from_json(&body)
+    // Wire format is msgpack on both directions. We deserialize into
+    // serde_json::Value (rmp-serde supports this transparently) so the
+    // existing untyped-walking Features extractor works unchanged.
+    let raw: serde_json::Value = rmp_serde::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("bad msgpack: {}", e)))?;
+
+    let features = Features::from_json(&raw)
         .ok_or_else(|| ApiError::BadRequest("malformed feature payload".to_string()))?;
 
     let req = build_request_context(&headers, &addr);
@@ -84,7 +92,7 @@ async fn identify(
     let outcome = matcher::identify(
         &state.pool,
         &features,
-        &body,
+        &raw,
         &req,
         state.match_threshold,
         state.ambiguous_threshold,
@@ -92,7 +100,7 @@ async fn identify(
     )
     .await?;
 
-    Ok(Json(IdentifyResponse {
+    let response_body = IdentifyResponse {
         visitor_id: outcome.visitor_id,
         match_kind: outcome.match_kind,
         score: outcome.score,
@@ -101,7 +109,16 @@ async fn identify(
         drift: outcome.drift,
         observation_count: outcome.observation_count,
         via_persistence: outcome.via_persistence,
-    }))
+    };
+
+    let bytes = rmp_serde::to_vec_named(&response_body)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("encode response: {}", e)))?;
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/msgpack"),
+    );
+    Ok(resp)
 }
 
 fn build_request_context(headers: &HeaderMap, addr: &SocketAddr) -> RequestContext {

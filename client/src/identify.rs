@@ -87,17 +87,13 @@ pub async fn identify(options: JsValue) -> Result<JsValue, JsValue> {
         }
     }
 
-    // Collect features and the local fallback identity in one pass.
+    // Collect features and encode directly to msgpack — no JS-bridge round-trip.
     let fp = crate::get_fingerprint().await?;
-    let payload = fp.to_json()?;
-    let payload_str = js_sys::JSON::stringify(&payload)?
-        .as_string()
-        .unwrap_or_else(|| "{}".to_string());
+    let body_bytes = fp.to_msgpack()?;
     let local_visitor_id = fp.visitor_id();
 
     // Server roundtrip. On any failure, fall back to local visitor_id.
-    let server_result =
-        post_features(&endpoint, api_key.as_deref(), &payload_str, timeout_ms).await;
+    let server_result = post_features(&endpoint, api_key.as_deref(), &body_bytes, timeout_ms).await;
 
     let identity = match server_result {
         Ok(server) => {
@@ -152,23 +148,23 @@ struct ServerResponse {
 async fn post_features(
     endpoint: &str,
     api_key: Option<&str>,
-    body: &str,
+    body: &[u8],
     timeout_ms: i32,
 ) -> Result<ServerResponse, JsValue> {
     let opts = RequestInit::new();
     opts.set_method("POST");
     opts.set_mode(RequestMode::Cors);
     opts.set_credentials(RequestCredentials::Include);
-    opts.set_body(&JsValue::from_str(body));
+    opts.set_body(&js_sys::Uint8Array::from(body));
 
     let headers = Headers::new()?;
-    headers.set("Content-Type", "application/json")?;
+    headers.set("Content-Type", "application/msgpack")?;
+    headers.set("Accept", "application/msgpack")?;
     if let Some(k) = api_key {
         headers.set("X-API-Key", k)?;
     }
     opts.set_headers(&headers);
 
-    // AbortController-based timeout.
     let abort = web_sys::AbortController::new()?;
     opts.set_signal(Some(&abort.signal()));
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
@@ -178,8 +174,9 @@ async fn post_features(
         .set_timeout_with_callback_and_timeout_and_arguments_0(cb.unchecked_ref(), timeout_ms);
 
     let request = Request::new_with_str_and_init(endpoint, &opts)?;
-    let response_value = JsFuture::from(window.fetch_with_request(&request)).await?;
-    let response: Response = response_value.dyn_into()?;
+    let response: Response = JsFuture::from(window.fetch_with_request(&request))
+        .await?
+        .dyn_into()?;
 
     if !response.ok() {
         return Err(JsValue::from_str(&format!(
@@ -188,13 +185,9 @@ async fn post_features(
         )));
     }
 
-    let text_value = JsFuture::from(response.text()?).await?;
-    let text = text_value
-        .as_string()
-        .ok_or_else(|| JsValue::from_str("response body not a string"))?;
-    let parsed: ServerResponse =
-        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&format!("bad json: {}", e)))?;
-    Ok(parsed)
+    let buffer = JsFuture::from(response.array_buffer()?).await?;
+    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+    rmp_serde::from_slice(&bytes).map_err(|e| JsValue::from_str(&format!("bad msgpack: {}", e)))
 }
 
 fn read_cache(ttl_seconds: f64) -> Option<IdentityResult> {
