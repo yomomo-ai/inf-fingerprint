@@ -71,8 +71,14 @@ async fn try_collect() -> Result<WebrtcFp, JsValue> {
     let offer_init: RtcSessionDescriptionInit = offer.unchecked_into();
     JsFuture::from(pc.set_local_description(&offer_init)).await?;
 
-    // STUN round-trip can take 600-1500ms on real networks.
-    sleep_ms(1500).await?;
+    // Adaptive wait: poll completion every 100ms, exit on null-candidate event.
+    // Hard cap at 1500ms for networks where STUN is silently dropped.
+    for _ in 0..15 {
+        sleep_ms(100).await?;
+        if *completed.borrow() {
+            break;
+        }
+    }
     pc.close();
 
     let raw_candidates: Vec<String> = raw.borrow().clone();

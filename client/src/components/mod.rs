@@ -70,6 +70,8 @@ pub struct Components {
 }
 
 pub async fn collect() -> Components {
+    // Synchronous collectors first — they're CPU work, not I/O. Run them on
+    // the main thread before yielding for the async fan-out.
     let canvas = canvas::collect();
     let webgl = webgl::collect();
     let webgl_render = webgl_render::collect();
@@ -85,13 +87,18 @@ pub async fn collect() -> Components {
     let quirks = quirks::collect();
     let persist = persist::collect();
 
-    let audio = audio::collect().await;
-    let permissions = permissions::collect().await;
-    let speech = speech::collect().await;
-    let webrtc = webrtc::collect().await;
-    let battery = battery::collect().await;
-    let storage_quota = storage_quota::collect().await;
-    let ua_high = ua_hints_high::collect().await;
+    // Async collectors run concurrently. Total time = max(slowest) instead of
+    // sum(all). WebRTC dominates (~800-1500ms), so the others come essentially
+    // free once we're already waiting for it.
+    let (audio, permissions, speech, webrtc, battery, storage_quota, ua_high) = futures::join!(
+        audio::collect(),
+        permissions::collect(),
+        speech::collect(),
+        webrtc::collect(),
+        battery::collect(),
+        storage_quota::collect(),
+        ua_hints_high::collect(),
+    );
 
     Components {
         canvas,

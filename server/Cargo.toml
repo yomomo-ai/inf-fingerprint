@@ -44,3 +44,4 @@ sqlx = { version = "0.8", default-features = false, features = [
 toml = "0.8"
 humantime-serde = "1"
 const_format = "0.2"
+moka = { version = "0.12", features = ["future"] }

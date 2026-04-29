@@ -18,8 +18,11 @@ async fn main() -> Result<()> {
     let pool = store::connect(&cfg).await?;
     store::migrate(&pool, &cfg.database.schema).await?;
 
+    let bucket_cache = matcher::new_bucket_cache(10_000, 60);
+
     let state = api::AppState {
         pool,
+        bucket_cache,
         api_key: cfg.server.api_key.clone(),
         match_threshold: cfg.matcher.match_threshold,
         ambiguous_threshold: cfg.matcher.ambiguous_threshold,

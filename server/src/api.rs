@@ -14,11 +14,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::{ApiError, ApiResult};
 use crate::features::Features;
-use crate::matcher::{self, RequestContext};
+use crate::matcher::{self, BucketCache, RequestContext};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub bucket_cache: BucketCache,
     pub api_key: Option<String>,
     pub match_threshold: f64,
     pub ambiguous_threshold: f64,
@@ -91,6 +92,7 @@ async fn identify(
 
     let outcome = matcher::identify(
         &state.pool,
+        &state.bucket_cache,
         &features,
         &raw,
         &req,
