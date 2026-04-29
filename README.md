@@ -36,19 +36,33 @@ inf-fingerprint/
 
 ## Client
 
+Build locally:
+
 ```bash
 cargo install wasm-pack
 wasm-pack build client --target web --release
 ```
 
+The published npm package is `inf-fingerprint`. The recommended entry point is
+`identify()`, which collects features, calls the server, caches the response in
+localStorage (with stale-while-revalidate), and falls back to a local hash when
+the server is unreachable:
+
 ```js
-import init, { getFingerprint } from "inf-fingerprint";
+import init, { identify } from "inf-fingerprint";
 
 await init();
-const fp = await getFingerprint();
-console.log(fp.visitorId);          // local fallback hash
-console.log(fp.toJSON());            // full feature payload — POST to /v1/identify
+const id = await identify({
+  endpoint: "https://fp.example.com/v1/identify",
+});
+console.log(id.visitor_id, id.match_kind, id.from_server);
 ```
+
+Full integration guide: [`docs/integration.zh.md`](docs/integration.zh.md).
+
+A lower-level `getFingerprint()` is also exported for callers who want the raw
+feature struct (e.g. to POST themselves, or to use the local hash without ever
+talking to a server).
 
 ## Server
 
@@ -72,9 +86,11 @@ in `fingerprint._sqlx_migrations` and run automatically on startup.
 
 ### `POST /v1/identify`
 
-Request: the JSON output of `getFingerprint().toJSON()`.
+Wire format is msgpack on both directions (`Content-Type: application/msgpack`).
+The request body is the msgpack-encoded feature struct produced by
+`getFingerprint()`; the SDK's `identify()` does this for you.
 
-Response:
+Response (decoded):
 
 ```json
 {
@@ -86,7 +102,8 @@ Response:
     { "visitor_id": "...", "score": 34.5, "hits": [["canonical_ua", 6.0], ...] }
   ],
   "drift": ["system_version", "canvas"],
-  "observation_count": 42
+  "observation_count": 42,
+  "via_persistence": false
 }
 ```
 
@@ -108,21 +125,30 @@ Tune in `[matcher]`.
 
 The Dockerfile is a 3-stage build: cargo-chef planner → cargo-chef builder
 (deps cached as long as `Cargo.toml`/`Cargo.lock` are unchanged) → distroless
-runtime (~35MB final, glibc only, no shell). To build for the deploy host
-from a Mac dev machine, target linux/amd64 explicitly:
+runtime (~35MB final, glibc only, no shell).
+
+CI publishes pre-built images to GHCR on every push to `main` — pull rather
+than rebuild unless you're modifying the Dockerfile:
 
 ```bash
-docker buildx build --platform linux/amd64 \
-  -t inf-fingerprint-server:0.1.0 \
-  -f server/Dockerfile .
-
+docker pull ghcr.io/yomomo-ai/inf-fingerprint-server:latest
 docker run -d \
   --name inf-fp \
+  --init \
+  --restart=unless-stopped \
   -p 28091:28091 \
   --add-host=host.docker.internal:host-gateway \
   -v /etc/inf-fp/config.toml:/app/config.toml:ro \
-  --restart=unless-stopped \
-  inf-fingerprint-server:0.1.0
+  ghcr.io/yomomo-ai/inf-fingerprint-server:latest
+```
+
+To build locally for the deploy host from a Mac dev machine, target
+linux/amd64 explicitly:
+
+```bash
+docker buildx build --platform linux/amd64 \
+  -t inf-fingerprint-server:dev \
+  -f server/Dockerfile .
 ```
 
 `--add-host=host.docker.internal:host-gateway` lets the container reach the
@@ -148,25 +174,20 @@ wasm-pack build client --target web --release
 `.github/workflows/build.yml` is path-aware: each push to `main` only
 publishes the parts that actually changed.
 
-- Touching `client/**` triggers a wasm-pack build and a conditional
-  `npm publish` of the package version in `client/Cargo.toml`. If that
-  version is already on npm the publish step no-ops with a notice; bump
-  `[package].version` to ship a new release.
-- Touching `server/**` (or anything the Dockerfile reads) triggers a docker
-  build and pushes `ghcr.io/yomomo-ai/inf-fingerprint-server` tagged with
-  `latest`, `main`, and the short SHA.
+- Touching `client/**` (or any shared file in the filter — `Cargo.toml`,
+  `Cargo.lock`, `rust-toolchain.toml`, `build.yml`) triggers a wasm-pack
+  build, then `npm publish` to the public registry. The patch number is
+  stamped automatically from `git rev-list --count HEAD` so every push
+  ships a fresh, monotonic version (`0.1.27`, `0.1.28`, …) — no manual
+  `Cargo.toml` bump required.
+- Touching `server/**` triggers a docker build and pushes
+  `ghcr.io/yomomo-ai/inf-fingerprint-server` tagged with `latest`, `main`,
+  and the short SHA.
 
-Cutting a client release:
-
-```bash
-$EDITOR client/Cargo.toml          # set [package].version = "0.2.0"
-cargo update -p inf-fingerprint --precise 0.2.0
-git commit -am "bump client to 0.2.0"
-git push
-```
-
-Server changes ship as soon as you push to `main` — the image always tracks
-HEAD via the `latest` and `<sha>` tags.
+To bump the major or minor (i.e. ship breaking changes), edit
+`client/Cargo.toml`'s `[package].version` to the new `MAJOR.MINOR.0` —
+the CI keeps your major/minor and rewrites only the patch. Document the
+break in this README before pushing.
 
 ## License
 

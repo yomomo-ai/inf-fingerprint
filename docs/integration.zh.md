@@ -25,21 +25,22 @@ const id = await identify({
 console.log(id.visitor_id); // "0d9f7c87-0c98-4d12-9c53-..."
 ```
 
-`init()` 必须在第一次调用前执行一次，加载 WASM 模块（约 140KB gz，浏览器自动缓存）。后续整个 tab 内复用，无需重复 `init`。
+`init()` 必须在第一次调用前执行一次，加载 WASM 模块（约 100KB gz：~92KB wasm + ~9KB JS glue，浏览器自动缓存）。后续整个 tab 内复用，无需重复 `init`。
 
 ## 三、返回字段
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `visitor_id` | string (UUID) | 稳定的访客 ID，**这是你要存的东西** |
-| `match_kind` | `"exact"` / `"fuzzy"` / `"ambiguous"` / `"new"` / `"offline"` | 匹配置信度，见下表 |
+| `visitor_id` | string | 稳定的访客 ID，**这是你要存的东西**。在线时是 UUID（如 `0d9f7c87-...`）；`match_kind === "offline"` 时是 16 位 hex 哈希 |
+| `match_kind` | string | `"exact"` / `"fuzzy"` / `"ambiguous"` / `"new"` / `"offline"`，见下方说明 |
 | `score` | number | 贝叶斯打分（log-likelihood），调试用 |
 | `second_score` | number | 第二高候选的分数，越接近 `score` 越可疑 |
-| `observation_count` | number | 该访客累计被观测过多少次 |
-| `via_persistence` | boolean | 是否走的 localStorage/cookie 快速路径（不是靠特征匹配） |
-| `from_server` | boolean | `false` 表示 server 不可达，走了本地兜底 |
-| `cached` | boolean | 本次结果是否来自浏览器本地缓存 |
-| `stale` | boolean | 缓存命中但已过 SWR 阈值，后台正在异步刷新 |
+| `observation_count` | number | 该访客在服务端累计被观测过多少次 |
+| `via_persistence` | boolean | **服务端**侧——`true` 表示客户端在请求体里带了之前存下的 `client_visitor_id` 且与服务端记录吻合，走了快速路径；`false` 表示靠特征 bucket 扫描匹配的（或新访客）。**和下面 `cached` 字段无关** |
+| `from_server` | boolean | 本次结果是否来自服务端响应。**注意**：从浏览器缓存读出来的也是 `true`（因为缓存的就是上次成功的服务端响应）；只有 server 完全不可达且无可用缓存时才是 `false` |
+| `cached` | boolean | 本次结果是否直接命中浏览器 localStorage 缓存（没发请求） |
+| `stale` | boolean | 缓存命中但已过 SWR 阈值，后台正在异步刷新；当前调用拿到的还是旧值 |
+| `cached_at_ms` | number | 此结果首次从服务端拿到的时间戳（`Date.now()` 毫秒），无论是否走缓存 |
 
 `match_kind` 含义：
 - `exact` — 高置信，新老访客都信任
@@ -53,7 +54,7 @@ console.log(id.visitor_id); // "0d9f7c87-0c98-4d12-9c53-..."
 ```ts
 identify({
   endpoint: string,           // 必填
-  apiKey?: string,            // 可选，目前未启用，留空即可
+  apiKey?: string,            // 可选；浏览器场景一律不传（见 §八）
   cacheTtlSeconds?: number,   // 缓存硬过期，默认 86400 (24h)
   staleSeconds?: number,      // SWR 软过期，默认 cacheTtlSeconds / 2
   forceRefresh?: boolean,     // 跳过缓存强制走网络，默认 false
@@ -72,7 +73,7 @@ identify({
 > 24h：       缓存失效，走网络
 ```
 
-所以**正常情况下首屏只有第一次访问会有约 100ms 网络延迟**，之后几乎零开销。`forceRefresh: true` 可强制重新识别，慎用。
+首次调用通常**几百 ms 到 1 秒**——大头是端侧特征采集（WebRTC 探测就有 ~800ms 上限），网络往返只占小头。**24h 内复用都是同步从 localStorage 读出来，零网络开销**。`forceRefresh: true` 可强制重新识别，慎用。
 
 ## 六、典型用法
 
@@ -134,22 +135,32 @@ function useFingerprint() {
 
 server 挂掉或网络不通时，`identify()` **不会抛异常**，而是返回：
 ```js
-{ match_kind: "offline", from_server: false, visitor_id: "<本地哈希>" }
+{
+  match_kind: "offline",
+  from_server: false,
+  visitor_id: "a3b5c7d9e1f24680", // 16 位 hex，xxh3 哈希
+  score: 0,
+  observation_count: 0,
+  ...
+}
 ```
 
-本地兜底 ID 是用浏览器特征算的快速哈希，**与 server 端 visitor_id 不在同一空间**，仅用于"页面能继续跑"的兜底，不要持久化或当作业务主键。建议业务侧检查 `from_server: false` 时不入库或单独打标。
+兜底 ID 是用本地采集到的稳定特征算的 xxh3 哈希（同设备同浏览器多次调用应该一致），**和服务端的 UUID 空间完全不同**。仅用于"页面能继续跑"的降级逻辑，**不要持久化或当作业务主键**——业务侧检查 `from_server === false` 时建议不入库或单独打标。
+
+极端情况：如果连特征采集本身都失败了（极少见，比如 WASM 启动异常），`visitor_id` 会是空字符串，`match_kind` 仍是 `"offline"`。建议消费侧统一用 `if (!id.from_server || !id.visitor_id) { /* 降级 */ }` 来兜。
 
 ## 八、CORS 与鉴权
 
-- 服务对所有 origin 开放，无 CORS 限制
-- 当前**不要求 apiKey**（浏览器藏不住 key），靠 nginx 30r/s per-IP 限流兜底
-- 不发 cookie，不依赖跨站 cookie
+- 服务对所有 origin 开放，无 CORS 限制；不发 cookie、不依赖跨站 cookie
+- **浏览器调用一律不传 `apiKey`**——浏览器藏不住 key（minify 后也是明文，F12 一开就看到），传了等于公开，反而让限流绕过对所有人生效
+- 普通浏览器调用受 nginx **30 r/s per-IP** 限流保护，超了返回 429
+- `apiKey` 字段仅留给**服务端可信调用方**：他们传对值就绕过 nginx 限流，浏览器里没必要也不应该用
 
 ## 九、版本与升级
 
 - npm 包名：`inf-fingerprint`
-- 版本号：CI 自动 stamp，每次 `client/**` 变更都会发布一个新 patch（如 `0.1.27`）
-- 升级直接 `npm update inf-fingerprint`，不会有破坏性变更直到 `0.2.x`
+- 版本号：CI 自动 stamp，每次 `client/**` 变更都会发布一个新 patch（patch 号用 main 分支累计 commit 数，如 `0.1.27`）
+- patch 之间保持向后兼容；major/minor bump（如 `0.2.0`）才会有破坏性变更，会在 README 里单列 changelog
 
 ## 十、问题反馈
 
