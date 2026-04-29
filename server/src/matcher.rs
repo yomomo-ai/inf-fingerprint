@@ -35,6 +35,11 @@ pub enum MatchKind {
 
 #[derive(Serialize, Debug, Clone)]
 pub struct CandidateScore {
+    // See note on IdentifyResponse.visitor_id — pin to hyphenated string
+    // so msgpack doesn't fall back to raw 16 bytes. SDK's ServerResponse
+    // doesn't deserialize this field today, but keep the on-wire shape
+    // consistent across all visitor_id occurrences.
+    #[serde(with = "uuid::serde::hyphenated")]
     pub visitor_id: Uuid,
     pub score: f64,
     pub hits: Vec<(&'static str, f64)>,

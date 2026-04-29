@@ -60,6 +60,11 @@ async fn health(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRespon
 
 #[derive(Serialize)]
 pub struct IdentifyResponse {
+    // Force hyphenated-string serialization. uuid's default serde adapts
+    // to the wire format (string for JSON, raw 16 bytes for msgpack); the
+    // SDK's response struct types `visitor_id: String`, so the bytes-path
+    // breaks decoding. Pin to hyphenated regardless of format.
+    #[serde(with = "uuid::serde::hyphenated")]
     pub visitor_id: uuid::Uuid,
     pub match_kind: matcher::MatchKind,
     pub score: f64,
