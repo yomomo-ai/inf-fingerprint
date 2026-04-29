@@ -20,7 +20,6 @@ use crate::matcher::{self, BucketCache, RequestContext};
 pub struct AppState {
     pub pool: PgPool,
     pub bucket_cache: BucketCache,
-    pub api_key: Option<String>,
     pub match_threshold: f64,
     pub ambiguous_threshold: f64,
     pub max_candidates: usize,
@@ -77,8 +76,6 @@ async fn identify(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Bytes,
 ) -> ApiResult<Response> {
-    check_api_key(&state, &headers)?;
-
     // Wire format is msgpack on both directions. We deserialize into
     // serde_json::Value (rmp-serde supports this transparently) so the
     // existing untyped-walking Features extractor works unchanged.
@@ -162,28 +159,3 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn check_api_key(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
-    let Some(expected) = state.api_key.as_deref() else {
-        return Ok(());
-    };
-    let provided = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        Ok(())
-    } else {
-        Err(ApiError::Unauthorized)
-    }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}

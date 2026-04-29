@@ -26,7 +26,6 @@ async fn main() -> Result<()> {
     let state = api::AppState {
         pool,
         bucket_cache,
-        api_key: cfg.server.api_key.clone(),
         match_threshold: cfg.matcher.match_threshold,
         ambiguous_threshold: cfg.matcher.ambiguous_threshold,
         max_candidates: cfg.matcher.max_candidates,

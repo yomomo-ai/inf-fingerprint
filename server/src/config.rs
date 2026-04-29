@@ -39,8 +39,6 @@ pub struct Pool {
 #[derive(Debug, Deserialize)]
 pub struct Server {
     pub bind: String,
-    #[serde(default)]
-    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

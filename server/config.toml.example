@@ -18,10 +18,6 @@ statement_timeout = "5s"
 
 [server]
 bind = "0.0.0.0:28091"
-# Leave commented out to allow unauthenticated calls (browsers can't hide a
-# key anyway; rely on edge rate-limit). Set only when gating server-side
-# callers from a trusted environment.
-# api_key = "long-random-string"
 
 [matcher]
 match_threshold = 12.0
