@@ -1,26 +1,30 @@
-FROM rust:1.85-slim AS builder
+# syntax=docker/dockerfile:1.7
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
+# Distill Cargo.toml/lock into a recipe describing the dependency graph.
+FROM lukemathwalker/cargo-chef:latest-rust-latest AS planner
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
-COPY client/ client/
-COPY server/ server/
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
+# Cook dependencies from the recipe. This layer is cached as long as the
+# recipe is unchanged (i.e. Cargo.toml and Cargo.lock haven't moved), so
+# editing source code reruns only the final cargo build, not the ~5min deps
+# compile.
+FROM lukemathwalker/cargo-chef:latest-rust-latest AS builder
+WORKDIR /build
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --package inf-fingerprint-server
+
+COPY . .
 RUN cargo build --release -p inf-fingerprint-server
 
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 1000 -m -s /bin/false app
-
-WORKDIR /app
+# Distroless cc-debian13: glibc + libssl + ca-certs, no shell, no package
+# manager, no busybox. ~25MB base; final image ~35MB; runs as nonroot
+# (uid 65532) with no writable filesystem outside /home/nonroot.
+FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=builder /build/target/release/inf-fingerprint-server /usr/local/bin/inf-fingerprint-server
 
-USER app
 EXPOSE 28091
 ENV INF_FP_CONFIG=/app/config.toml
-CMD ["/usr/local/bin/inf-fingerprint-server"]
+WORKDIR /app
+ENTRYPOINT ["/usr/local/bin/inf-fingerprint-server"]

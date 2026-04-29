@@ -106,8 +106,15 @@ Tune in `[matcher]`.
 
 ### Deploy
 
+The Dockerfile is a 3-stage build: cargo-chef planner → cargo-chef builder
+(deps cached as long as `Cargo.toml`/`Cargo.lock` are unchanged) → distroless
+runtime (~35MB final, glibc only, no shell). To build for the deploy host
+from a Mac dev machine, target linux/amd64 explicitly:
+
 ```bash
-docker build -t inf-fingerprint-server:0.1.0 -f server/Dockerfile .
+docker buildx build --platform linux/amd64 \
+  -t inf-fingerprint-server:0.1.0 \
+  -f server/Dockerfile .
 
 docker run -d \
   --name inf-fp \
@@ -119,8 +126,12 @@ docker run -d \
 ```
 
 `--add-host=host.docker.internal:host-gateway` lets the container reach the
-Postgres at the host's IP if you're running PG outside Docker. On macOS /
-Windows it's a no-op (already resolves).
+Postgres at the host's IP when PG runs outside Docker. On macOS / Windows
+the alias resolves natively.
+
+Distroless has no shell, so `docker exec -it inf-fp sh` doesn't work — for
+debugging, swap the runtime base to `gcr.io/distroless/cc-debian13:debug`
+(includes busybox) or run the binary in a regular `debian:bookworm-slim`.
 
 ## Develop
 
