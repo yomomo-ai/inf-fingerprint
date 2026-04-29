@@ -34,8 +34,8 @@ pub struct IdentityResult {
     /// candidate dominates the second; `0.5` means the matcher couldn't
     /// distinguish two candidates. Risk-control callers should compare
     /// this rather than raw `score` (which doesn't normalize across
-    /// population or threshold drift). `0.0` for offline fallback or
-    /// when an older server didn't emit the field.
+    /// population or threshold drift). `0.0` only on the offline path,
+    /// where there's no candidate set to compute a margin against.
     pub confidence: f64,
     pub observation_count: i64,
     pub via_persistence: bool,
@@ -256,10 +256,6 @@ struct ServerResponse {
     observation_count: i64,
     #[serde(default)]
     via_persistence: bool,
-    /// Margin-based confidence in `[0, 1]`. Older servers that don't
-    /// emit this field yet decode as `0.0`; treat 0.0 as "unknown" on
-    /// the consumer side rather than "definitely not confident".
-    #[serde(default)]
     confidence: f64,
 }
 
