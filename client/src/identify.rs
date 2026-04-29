@@ -37,7 +37,6 @@ pub struct IdentityResult {
     pub cached_at_ms: f64,
 }
 
-#[derive(Serialize, Deserialize)]
 struct CachedIdentity {
     version: u8,
     visitor_id: String,
@@ -47,6 +46,63 @@ struct CachedIdentity {
     observation_count: i64,
     via_persistence: bool,
     cached_at_ms: f64,
+}
+
+impl CachedIdentity {
+    /// `key=value` line format. Avoids pulling in serde_json (~30 KB gz on
+    /// the wasm bundle) just to (de)serialize this 8-field struct.
+    /// `visitor_id` and `match_kind` come from server-controlled output that
+    /// excludes `\n`, so newline is a safe row delimiter.
+    fn to_storage_string(&self) -> String {
+        format!(
+            "v={}\nid={}\nk={}\ns={}\nss={}\nc={}\np={}\nt={}",
+            self.version,
+            self.visitor_id,
+            self.match_kind,
+            self.score,
+            self.second_score,
+            self.observation_count,
+            if self.via_persistence { 1 } else { 0 },
+            self.cached_at_ms,
+        )
+    }
+
+    fn from_storage_string(raw: &str) -> Option<Self> {
+        let mut version: Option<u8> = None;
+        let mut visitor_id: Option<String> = None;
+        let mut match_kind: Option<String> = None;
+        let mut score: Option<f64> = None;
+        let mut second_score: Option<f64> = None;
+        let mut observation_count: Option<i64> = None;
+        let mut via_persistence: Option<bool> = None;
+        let mut cached_at_ms: Option<f64> = None;
+
+        for line in raw.split('\n') {
+            let (key, value) = line.split_once('=')?;
+            match key {
+                "v" => version = value.parse().ok(),
+                "id" => visitor_id = Some(value.to_string()),
+                "k" => match_kind = Some(value.to_string()),
+                "s" => score = value.parse().ok(),
+                "ss" => second_score = value.parse().ok(),
+                "c" => observation_count = value.parse().ok(),
+                "p" => via_persistence = Some(value == "1"),
+                "t" => cached_at_ms = value.parse().ok(),
+                _ => {}
+            }
+        }
+
+        Some(Self {
+            version: version?,
+            visitor_id: visitor_id?,
+            match_kind: match_kind?,
+            score: score?,
+            second_score: second_score?,
+            observation_count: observation_count?,
+            via_persistence: via_persistence?,
+            cached_at_ms: cached_at_ms?,
+        })
+    }
 }
 
 /// Run the full identification pipeline.
@@ -230,7 +286,7 @@ fn read_cache(ttl_seconds: f64) -> Option<IdentityResult> {
     let win = web_sys::window()?;
     let storage = win.local_storage().ok()??;
     let raw = storage.get_item(CACHE_KEY).ok()??;
-    let parsed: CachedIdentity = serde_json::from_str(&raw).ok()?;
+    let parsed = CachedIdentity::from_storage_string(&raw)?;
     if parsed.version != CACHE_VERSION {
         return None;
     }
@@ -269,9 +325,7 @@ fn write_cache(identity: &IdentityResult) {
         via_persistence: identity.via_persistence,
         cached_at_ms: identity.cached_at_ms,
     };
-    if let Ok(s) = serde_json::to_string(&cached) {
-        let _ = storage.set_item(CACHE_KEY, &s);
-    }
+    let _ = storage.set_item(CACHE_KEY, &cached.to_storage_string());
 }
 
 fn now_ms() -> f64 {
