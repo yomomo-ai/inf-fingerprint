@@ -63,6 +63,8 @@ jobs:
     if: needs.changes.outputs.client == 'true'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,6 +74,18 @@ jobs:
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # Derive patch version from commit count so every push to client/**
+      # publishes a fresh, monotonically increasing version. Cargo.toml's
+      # patch number is just a placeholder; CI is the source of truth.
+      - name: Stamp client version
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          MAJOR_MINOR=$(grep '^version = ' client/Cargo.toml | head -1 | sed 's/version = "\([0-9]*\.[0-9]*\)\..*"/\1/')
+          NEW="${MAJOR_MINOR}.${COUNT}"
+          sed -i "/^\[package\]\$/,/^\[/{s/^version = \".*\"\$/version = \"${NEW}\"/;}" client/Cargo.toml
+          echo "stamped client version: ${NEW}"
+          grep '^version' client/Cargo.toml | head -1
 
       - run: wasm-pack build client --target web --release
 
@@ -116,7 +130,7 @@ jobs:
           PKG_VERSION=$(node -p "require('./package.json').version")
           echo "Checking $PKG_NAME@$PKG_VERSION"
           if npm view "$PKG_NAME@$PKG_VERSION" version 2>/dev/null | grep -q .; then
-            echo "::notice::$PKG_NAME@$PKG_VERSION already on npm; bump client/Cargo.toml [package].version to release a new build"
+            echo "::notice::$PKG_NAME@$PKG_VERSION already on npm; this is a CI re-run of the same commit, skipping publish"
             exit 0
           fi
           npm publish --access public
