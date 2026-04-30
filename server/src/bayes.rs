@@ -603,7 +603,8 @@ mod tests {
         // Genuinely physical signals — these differ between two real Macs:
         f.canonical_ua_hash = "ua-clone-host".into();
         f.canvas_hash = Some("canvas-clone-host".into());
-        f.hw_concurrency = Some(10.0); // sig has 6, request has 10
+        // sig has hw_concurrency=6, request has 10 — physically different.
+        f.hw_concurrency = Some(10.0);
         // Screen on a different model is also different.
         f.screen_w = Some(1920);
         f.screen_h = Some(1080);
