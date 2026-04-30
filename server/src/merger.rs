@@ -123,13 +123,12 @@ pub async fn merge_visitors(
     // when it tries to reassign observations to a non-existent visitor.
     // Fail fast with a typed error so the caller gets BadRequest instead
     // of 500.
-    let canonical_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM visitors WHERE visitor_id = $1)",
-    )
-    .bind(canonical)
-    .fetch_one(&mut *tx)
-    .await
-    .context("checking canonical visitor existence")?;
+    let canonical_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM visitors WHERE visitor_id = $1)")
+            .bind(canonical)
+            .fetch_one(&mut *tx)
+            .await
+            .context("checking canonical visitor existence")?;
     if !canonical_exists {
         return Err(MergeError::UnknownCanonical(canonical));
     }

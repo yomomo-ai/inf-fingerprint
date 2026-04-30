@@ -263,7 +263,9 @@ async fn feedback(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<
         MergeError::UnknownCanonical(id) => {
             ApiError::BadRequest(format!("unknown canonical visitor: {id}"))
         }
-        MergeError::EmptyInput => ApiError::BadRequest("merge requires at least 1 visitor_id".into()),
+        MergeError::EmptyInput => {
+            ApiError::BadRequest("merge requires at least 1 visitor_id".into())
+        }
         // DB / audit errors stay 500 — these are real internal failures
         // and the caller can't act on them.
         MergeError::Other(e) => ApiError::Internal(anyhow::anyhow!("merge: {e}")),
