@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::error::{ApiError, ApiResult};
 use crate::features::Features;
 use crate::matcher::{self, BucketCache, RequestContext};
-use crate::merger::{self, MergeSource};
+use crate::merger::{self, MergeError, MergeSource};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -256,7 +256,18 @@ async fn feedback(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResult<
         MergeSource::FeedbackApi,
     )
     .await
-    .map_err(|e| ApiError::Internal(anyhow::anyhow!("merge: {}", e)))?;
+    .map_err(|e| match e {
+        // Caller fed us a visitor_id we've never seen — most often a stale
+        // browser cache. Return 400 so the client can clear/re-identify
+        // and retry instead of treating this as an internal failure.
+        MergeError::UnknownCanonical(id) => {
+            ApiError::BadRequest(format!("unknown canonical visitor: {id}"))
+        }
+        MergeError::EmptyInput => ApiError::BadRequest("merge requires at least 1 visitor_id".into()),
+        // DB / audit errors stay 500 — these are real internal failures
+        // and the caller can't act on them.
+        MergeError::Other(e) => ApiError::Internal(anyhow::anyhow!("merge: {e}")),
+    })?;
 
     let response_body = FeedbackResponse {
         canonical_visitor_id: outcome.canonical_visitor_id,

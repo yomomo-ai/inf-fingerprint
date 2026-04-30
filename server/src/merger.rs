@@ -21,6 +21,38 @@ use uuid::Uuid;
 use crate::bayes;
 use crate::matcher::{BucketCache, SignatureRow};
 
+/// Errors raised by [`merge_visitors`]. Distinguishes caller-input issues
+/// (treat as 400) from internal failures (500). The previous behaviour
+/// surfaced everything as 500 because a missing canonical hit an FK
+/// violation deep inside the transaction — actionable on the operator
+/// side but indistinguishable from a real bug for the caller.
+#[derive(Debug, thiserror::Error)]
+pub enum MergeError {
+    /// First id in the input doesn't exist in `visitors` and isn't
+    /// reachable through the merge audit chain. Almost always a stale
+    /// browser cache or a fabricated id — return BadRequest to the
+    /// caller so it can clear / re-identify and try again.
+    #[error("unknown canonical visitor: {0}")]
+    UnknownCanonical(Uuid),
+
+    /// No visitor ids supplied at all. API-level validation should catch
+    /// this before us, but the merger keeps its own guard for direct
+    /// callers (e.g. [`auto_merge_pass`] passing arrays it built).
+    #[error("merge_visitors: no visitor ids supplied")]
+    EmptyInput,
+
+    /// Anything else — DB connection drops, query plan errors, audit
+    /// insert failures. Bubbled up as 500.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl From<sqlx::Error> for MergeError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Other(anyhow::Error::from(err))
+    }
+}
+
 /// Score above which the auto-merge pass will collapse two visitors without
 /// human review. Set well above `match_threshold` (12) and even above
 /// `match_threshold + 10` (the "exact" cutoff) so the system only auto-acts
@@ -65,18 +97,43 @@ pub struct MergeOutcome {
 /// folded into it. Cache is invalidated wholesale — granular invalidation
 /// would require knowing every recall key the merged visitors had been
 /// indexed under, and the 60s TTL covers that case anyway.
+///
+/// Returns [`MergeError::UnknownCanonical`] when the first id resolves to
+/// a visitor that doesn't exist (browser cached a stale id, never went
+/// through `/v1/identify`, or hand-fabricated). The api handler maps that
+/// to 400 — without the early check, the same input would reach
+/// `merge_pair_in_tx`'s `UPDATE observations` and trip the FK constraint
+/// on `observations.visitor_id`, surfacing as an opaque 500.
 pub async fn merge_visitors(
     pool: &PgPool,
     cache: &BucketCache,
     visitor_ids: &[Uuid],
     reason: &str,
     source: MergeSource,
-) -> Result<MergeOutcome> {
+) -> Result<MergeOutcome, MergeError> {
     if visitor_ids.is_empty() {
-        anyhow::bail!("merge_visitors: no visitor ids supplied");
+        return Err(MergeError::EmptyInput);
     }
     let mut tx = pool.begin().await?;
     let canonical = resolve_canonical_in_tx(&mut tx, visitor_ids[0]).await?;
+
+    // Guard: canonical must be a live visitor row. A stale id resolves to
+    // itself (no audit hop) but won't be in `visitors` — letting it
+    // through means the first `merge_pair_in_tx` call hits an FK violation
+    // when it tries to reassign observations to a non-existent visitor.
+    // Fail fast with a typed error so the caller gets BadRequest instead
+    // of 500.
+    let canonical_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM visitors WHERE visitor_id = $1)",
+    )
+    .bind(canonical)
+    .fetch_one(&mut *tx)
+    .await
+    .context("checking canonical visitor existence")?;
+    if !canonical_exists {
+        return Err(MergeError::UnknownCanonical(canonical));
+    }
+
     let mut merged_ids = Vec::new();
     for &raw_id in &visitor_ids[1..] {
         let id = resolve_canonical_in_tx(&mut tx, raw_id).await?;
