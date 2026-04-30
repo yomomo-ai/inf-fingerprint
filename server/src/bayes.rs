@@ -90,6 +90,12 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
     }
 
     if f.canvas_stable.unwrap_or(true) {
+        // Mismatch penalty bumped from -2 to -4 after observing macOS
+        // clone-class collisions. Apple normalizes audio/fonts/dom/speech
+        // across Macs so those features pile up false-positive evidence;
+        // canvas is one of the few features where two distinct M-series
+        // chips actually produce different pixel hashes, so a mismatch
+        // here needs to weigh more.
         add_str(
             &mut total,
             &mut hits,
@@ -97,7 +103,7 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
             sig.canvas_hash.as_deref(),
             f.canvas_hash.as_deref(),
             3.0,
-            -2.0,
+            -4.0,
         );
     }
 
@@ -162,9 +168,11 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         -2.0,
     );
 
-    // screen dims — already part of bucket key, so within-bucket collision is
-    // tautologically high. Tiny positive as confirmation; large negative on
-    // mismatch flags an upstream bug.
+    // screen dims — no longer in the recall bucket key, so within-pool
+    // collisions are common (M4 Air vs M5 Air at the same office have
+    // different display configs). Tiny positive as confirmation; mismatch
+    // is a real "different physical machine" signal so penalty bumped
+    // from -2 to -3.
     if let (Some(sw), Some(sh), Some(dpr)) = (f.screen_w, f.screen_h, f.device_pixel_ratio) {
         let dims_match = Some(sw) == sig.screen_w
             && Some(sh) == sig.screen_h
@@ -172,7 +180,7 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
                 Some(a) => (a - dpr).abs() < 0.01,
                 None => false,
             };
-        let v = if dims_match { 0.5 } else { -2.0 };
+        let v = if dims_match { 0.5 } else { -3.0 };
         total += v;
         hits.push(("screen", v));
     }
@@ -200,10 +208,16 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         -1.0,
     );
 
-    // hw_concurrency — partly absorbed by bucket key. Match is weak;
-    // mismatch suggests a real device change.
+    // hw_concurrency — `navigator.hardwareConcurrency` reports the OS-level
+    // CPU thread count. Apple does NOT normalize this across Mac models
+    // (M4 Air = 8, M5 Air = 10, M-series Pro = 12+), so it's one of the
+    // most reliable physical discriminators we have. No longer in the
+    // recall bucket key, so two same-OS-different-CPU machines now reach
+    // Bayes together — bump mismatch from -1 to -4 to tip the verdict
+    // when the macOS-WebKit-normalized features (audio/fonts/dom/speech)
+    // are otherwise piling up false agreement.
     if let (Some(a), Some(b)) = (sig.hw_concurrency, f.hw_concurrency) {
-        let v = if (a - b).abs() < 0.5 { 0.5 } else { -1.0 };
+        let v = if (a - b).abs() < 0.5 { 0.5 } else { -4.0 };
         total += v;
         hits.push(("hw_concurrency", v));
     }
@@ -354,7 +368,58 @@ pub fn score(sig: &Signature, f: &Features) -> ScoreBreakdown {
         hits.push(("webrtc_public_ip", v));
     }
 
+    // Multi-modal hardware-class veto.
+    //
+    // The matcher can otherwise be fooled by macOS-WebKit normalization:
+    // audio/fonts/dom_rect/speech/math/webgl_render are nearly identical
+    // across same-OS-same-Safari Macs even when the underlying machines
+    // differ, and their cumulative positive evidence (~+20) can swamp a
+    // few mismatches on truly discriminative fields. To prevent that,
+    // require that AT LEAST ONE of the three "physical machine" signals
+    // — canvas pixels, canonical UA, hardwareConcurrency — agree before
+    // the score is allowed to clear `match_threshold`. If all three
+    // disagree (and we have data on all three), apply a hard penalty
+    // that reliably pushes the total below 12.
+    let canvas_signal = canvas_disagrees(sig, f);
+    let ua_signal = canonical_ua_disagrees(sig, f);
+    let hw_signal = hw_concurrency_disagrees(sig, f);
+    if matches!(canvas_signal, Some(true))
+        && matches!(ua_signal, Some(true))
+        && matches!(hw_signal, Some(true))
+    {
+        let v = -10.0;
+        total += v;
+        hits.push(("hardware_class_mismatch", v));
+    }
+
     ScoreBreakdown { total, hits }
+}
+
+/// `Some(true)` = canvases compare as different, `Some(false)` = they
+/// compare as equal, `None` = at least one side is missing the field
+/// (so we can't make a hardware-class claim from it).
+fn canvas_disagrees(sig: &Signature, f: &Features) -> Option<bool> {
+    // Treat canvas as no-signal when the request marked it unstable —
+    // farbling/ATFP browsers produce different canvases per call from
+    // the same machine, which would otherwise feed a false "different".
+    if !f.canvas_stable.unwrap_or(true) {
+        return None;
+    }
+    match (sig.canvas_hash.as_deref(), f.canvas_hash.as_deref()) {
+        (Some(a), Some(b)) => Some(a != b),
+        _ => None,
+    }
+}
+
+fn canonical_ua_disagrees(sig: &Signature, f: &Features) -> Option<bool> {
+    Some(sig.canonical_ua_hash != f.canonical_ua_hash)
+}
+
+fn hw_concurrency_disagrees(sig: &Signature, f: &Features) -> Option<bool> {
+    match (sig.hw_concurrency, f.hw_concurrency) {
+        (Some(a), Some(b)) => Some((a - b).abs() >= 0.5),
+        _ => None,
+    }
 }
 
 fn add_str(
@@ -520,6 +585,45 @@ mod tests {
         f.canvas_hash = Some("totally-different".into());
         let s = score(&sig(), &f);
         assert!(!s.hits.iter().any(|(name, _)| *name == "canvas"));
+    }
+
+    /// Regression for the macOS-WebKit clone-class collision observed
+    /// 2026-04-30 (visitor_id=334c7d25...): two distinct M-series Macs
+    /// at the same office got merged because audio/fonts/dom_rect/speech/
+    /// math/webgl_render all match by virtue of Apple's normalization,
+    /// while canvas + canonical_ua + hw_concurrency (the genuinely
+    /// physical signals) all disagreed. Must NOT cross match_threshold.
+    #[test]
+    fn macos_clone_class_does_not_match() {
+        let mut f = feat();
+        // Apple normalizes these — same OS / Safari → identical hashes
+        // even on different Macs. Keep them matching.
+        // (audio_hash, fonts, dom_rect, speech, math, webgl_render unchanged)
+        //
+        // Genuinely physical signals — these differ between two real Macs:
+        f.canonical_ua_hash = "ua-clone-host".into();
+        f.canvas_hash = Some("canvas-clone-host".into());
+        f.hw_concurrency = Some(10.0); // sig has 6, request has 10
+        // Screen on a different model is also different.
+        f.screen_w = Some(1920);
+        f.screen_h = Some(1080);
+        f.device_pixel_ratio = Some(2.0);
+        // No shared persistence cookie.
+        f.client_visitor_id = None;
+
+        let s = score(&sig(), &f);
+        assert!(
+            s.total < 12.0,
+            "macOS clone-class score {} should NOT clear match_threshold (12.0); breakdown: {:?}",
+            s.total,
+            s.hits
+        );
+        // The hardware-class veto should fire.
+        assert!(
+            s.hits.iter().any(|(n, _)| *n == "hardware_class_mismatch"),
+            "expected hardware_class_mismatch hit; got {:?}",
+            s.hits
+        );
     }
 
     /// Adversary scenario: different person on same iPhone model + WeChat
